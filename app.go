@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os/exec"
 	"path/filepath"
+	"strings"
 
 	wailsRuntime "github.com/wailsapp/wails/v2/pkg/runtime"
 )
@@ -37,14 +38,6 @@ func (a *App) SelectInstaller() (string, error) {
 	return path, validateInstallerPath(path)
 }
 
-func (a *App) SelectIcon() (string, error) {
-	path, err := wailsRuntime.OpenFileDialog(a.ctx, wailsRuntime.OpenDialogOptions{Title: "Seleccionar icono", Filters: []wailsRuntime.FileFilter{{DisplayName: "Imágenes (*.png;*.svg;*.ico)", Pattern: "*.png;*.svg;*.ico"}}})
-	if err != nil || path == "" {
-		return path, err
-	}
-	return path, validateIconPath(path)
-}
-
 func (a *App) WineStatus() WineStatus { return detectWine(a.commandContext(), a.run) }
 func (a *App) InstallWine() OperationResult {
 	if _, err := exec.LookPath("pkexec"); err != nil {
@@ -66,17 +59,19 @@ func (a *App) Install(req InstallRequest) OperationResult {
 	if err := validateInstallerPath(req.InstallerPath); err != nil {
 		return OperationResult{Message: err.Error()}
 	}
-	if err := validateDesktopName(req.Name); err != nil {
-		return OperationResult{Message: err.Error()}
-	}
-	if err := validateIconPath(req.IconPath); err != nil {
-		return OperationResult{Message: err.Error()}
-	}
+	name := applicationName(req.InstallerPath)
 	prefix, err := winePrefix()
 	if err != nil {
 		return OperationResult{Message: err.Error()}
 	}
-	command, err := installerCommand(req.InstallerPath)
+	target := req.InstallerPath
+	if strings.EqualFold(filepath.Ext(req.InstallerPath), ".exe") {
+		target, err = copyPortableExecutable(req.InstallerPath, prefix, name)
+		if err != nil {
+			return OperationResult{Message: err.Error()}
+		}
+	}
+	command, err := installerCommand(target)
 	if err != nil {
 		return OperationResult{Message: err.Error()}
 	}
@@ -86,19 +81,36 @@ func (a *App) Install(req InstallRequest) OperationResult {
 	if err != nil {
 		return OperationResult{Message: fmt.Sprintf("No se pudo iniciar el archivo: %v", err)}
 	}
-	go a.finishInstall(process, req, prefix, before)
+	go a.finishInstall(process, req, target, prefix, before)
 	a.emit(a.commandContext(), "installer-status", InstallerStatus{Status: "running", Message: "El archivo se está ejecutando con Wine."})
 	return OperationResult{Success: true, Message: "La operación está en ejecución. Esperá a que finalice para crear el acceso directo."}
 }
 
-func (a *App) finishInstall(process CommandProcess, req InstallRequest, prefix string, before map[string]struct{}) {
+// Uninstall opens Wine's official uninstaller for the shared application prefix.
+func (a *App) Uninstall() OperationResult {
+	prefix, err := winePrefix()
+	if err != nil {
+		return OperationResult{Message: err.Error()}
+	}
+	process, err := a.startEnv(a.commandContext(), wineEnvironmentForPrefix(prefix), "wine", "uninstaller")
+	if err != nil {
+		return OperationResult{Message: fmt.Sprintf("No se pudo abrir el desinstalador de Wine: %v", err)}
+	}
+	go func() {
+		if err := process.Wait(); err != nil {
+			a.emit(a.commandContext(), "installer-status", InstallerStatus{Status: "failed", Message: fmt.Sprintf("El desinstalador terminó con un error: %v.", err)})
+		}
+	}()
+	return OperationResult{Success: true, Message: "Se abrió el desinstalador oficial de Wine."}
+}
+
+func (a *App) finishInstall(process CommandProcess, req InstallRequest, target, prefix string, before map[string]struct{}) {
 	if err := process.Wait(); err != nil {
 		a.emit(a.commandContext(), "installer-status", InstallerStatus{Status: "failed", Message: fmt.Sprintf("La operación terminó con un error: %v.", err)})
 		return
 	}
-	target := req.InstallerPath
 	message := "La aplicación finalizó correctamente."
-	if filepath.Ext(req.InstallerPath) == ".msi" || filepath.Ext(req.InstallerPath) == ".MSI" {
+	if strings.EqualFold(filepath.Ext(req.InstallerPath), ".msi") {
 		var count int
 		target, count = discoverInstalledExecutable(prefix, before)
 		if count != 1 {

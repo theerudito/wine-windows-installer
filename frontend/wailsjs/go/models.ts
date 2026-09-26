@@ -2,8 +2,6 @@ export namespace main {
 	
 	export class InstallRequest {
 	    installerPath: string;
-	    name: string;
-	    iconPath: string;
 	
 	    static createFrom(source: any = {}) {
 	        return new InstallRequest(source);
@@ -12,8 +10,6 @@ export namespace main {
 	    constructor(source: any = {}) {
 	        if ('string' === typeof source) source = JSON.parse(source);
 	        this.installerPath = source["installerPath"];
-	        this.name = source["name"];
-	        this.iconPath = source["iconPath"];
 	    }
 	}
 	export class OperationResult {

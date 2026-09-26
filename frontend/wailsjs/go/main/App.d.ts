@@ -6,8 +6,8 @@ export function Install(arg1:main.InstallRequest):Promise<main.OperationResult>;
 
 export function InstallWine():Promise<main.OperationResult>;
 
-export function SelectIcon():Promise<string>;
-
 export function SelectInstaller():Promise<string>;
+
+export function Uninstall():Promise<main.OperationResult>;
 
 export function WineStatus():Promise<main.WineStatus>;

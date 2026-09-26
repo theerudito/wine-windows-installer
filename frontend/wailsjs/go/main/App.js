@@ -10,12 +10,12 @@ export function InstallWine() {
   return window['go']['main']['App']['InstallWine']();
 }
 
-export function SelectIcon() {
-  return window['go']['main']['App']['SelectIcon']();
-}
-
 export function SelectInstaller() {
   return window['go']['main']['App']['SelectInstaller']();
+}
+
+export function Uninstall() {
+  return window['go']['main']['App']['Uninstall']();
 }
 
 export function WineStatus() {
