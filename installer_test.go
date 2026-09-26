@@ -7,6 +7,7 @@ import (
 	"runtime"
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestValidateInstallerPath(t *testing.T) {
@@ -80,7 +81,7 @@ func TestWriteDesktopEntry(t *testing.T) {
 		t.Fatal(err)
 	}
 	text := string(content)
-	if !strings.Contains(text, `Exec=wine "`) || !strings.Contains(text, "Installed App.exe") || strings.Contains(text, "my setup.msi") {
+	if !strings.Contains(text, `Exec=env "WINEPREFIX=`) || !strings.Contains(text, "Installed App.exe") || strings.Contains(text, "my setup.msi") {
 		t.Fatalf("unexpected desktop entry: %s", text)
 	}
 	info, err := os.Stat(path)
@@ -126,11 +127,31 @@ func TestDesktopEntryTargetsSelectedExecutable(t *testing.T) {
 				t.Fatal(err)
 			}
 			text := string(content)
-			expected := "Exec=wine " + desktopExecArg(target)
+			expected := " wine " + desktopExecArg(target)
 			if !strings.Contains(text, expected) || target != installer && strings.Contains(text, filepath.Base(installer)) {
 				t.Fatalf("desktop entry = %s", text)
 			}
 		})
+	}
+}
+
+func TestDesktopEntryUsesCommonWinePrefix(t *testing.T) {
+	home := t.TempDir()
+	installer := filepath.Join(home, "setup.exe")
+	target := filepath.Join(home, "installed.exe")
+	for _, path := range []string{installer, target} {
+		if err := os.WriteFile(path, nil, 0600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	prefix := filepath.Join(home, "programas")
+	_, content, err := desktopEntryWithPrefix(DesktopRequest{InstallerPath: installer, TargetPath: target, Name: "Safe App"}, prefix)
+	if err != nil {
+		t.Fatal(err)
+	}
+	expected := "Exec=env " + desktopExecArg("WINEPREFIX="+prefix) + " wine " + desktopExecArg(target)
+	if !strings.Contains(content, expected) || strings.Contains(content, ".wine") {
+		t.Fatalf("desktop entry = %s", content)
 	}
 }
 
@@ -180,6 +201,25 @@ func TestInstallerCommand(t *testing.T) {
 	}
 }
 
+func TestWinePrefixForHomeCreatesCommonPrefix(t *testing.T) {
+	home := t.TempDir()
+	prefix, err := winePrefixForHome(home)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := filepath.Join(home, "programas")
+	if prefix != want {
+		t.Fatalf("prefix = %q, want %q", prefix, want)
+	}
+	info, err := os.Stat(prefix)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !info.IsDir() {
+		t.Fatalf("prefix %q is not a directory", prefix)
+	}
+}
+
 func TestMSIInstallCommandRemainsCorrect(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "setup.msi")
 	if err := os.WriteFile(path, nil, 0600); err != nil {
@@ -195,24 +235,103 @@ func TestMSIInstallCommandRemainsCorrect(t *testing.T) {
 	}
 }
 
-func TestRunInstallerUsesSeparateArguments(t *testing.T) {
+func TestRunInstallerUsesCommonPrefixForEXEAndMSI(t *testing.T) {
+	for _, ext := range []string{".exe", ".msi"} {
+		t.Run(ext, func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "setup"+ext)
+			if err := os.WriteFile(path, nil, 0600); err != nil {
+				t.Fatal(err)
+			}
+			var gotEnv []string
+			var gotArgs []string
+			app := &App{
+				startEnv: func(_ context.Context, env []string, _ string, args ...string) (CommandProcess, error) {
+					gotEnv, gotArgs = env, args
+					return fakeProcess{}, nil
+				},
+				emit: func(context.Context, string, ...interface{}) {},
+			}
+			if result := app.RunInstaller(path); !result.Success {
+				t.Fatalf("result = %#v", result)
+			}
+			if len(gotEnv) != 1 || !strings.HasPrefix(gotEnv[0], "WINEPREFIX=") || strings.HasSuffix(gotEnv[0], ".wine") {
+				t.Fatalf("env = %#v, want common Wine prefix", gotEnv)
+			}
+			if ext == ".msi" && strings.Join(gotArgs, "\x00") != strings.Join([]string{"msiexec", "/i", path}, "\x00") {
+				t.Fatalf("args = %#v, want MSI arguments", gotArgs)
+			}
+		})
+	}
+}
+
+func TestRunTargetUsesSeparateArguments(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "portable app.exe")
 	if err := os.WriteFile(path, nil, 0600); err != nil {
 		t.Fatal(err)
 	}
 	var gotName string
 	var gotArgs []string
+	var gotEnv []string
 	app := &App{
-		start: func(_ context.Context, name string, args ...string) error {
+		startEnv: func(_ context.Context, env []string, name string, args ...string) (CommandProcess, error) {
+			gotEnv = env
 			gotName, gotArgs = name, args
-			return nil
+			return &fakeProcess{}, nil
 		},
 	}
-	result := app.RunInstaller(path)
-	if !result.Success || gotName != "wine" || len(gotArgs) != 1 || gotArgs[0] != path {
-		t.Fatalf("result = %#v, command = %q %#v", result, gotName, gotArgs)
+	result := app.RunTarget(path)
+	if !result.Success || gotName != "wine" || len(gotArgs) != 1 || gotArgs[0] != path || len(gotEnv) != 1 || !strings.HasPrefix(gotEnv[0], "WINEPREFIX=") || strings.HasSuffix(gotEnv[0], ".wine") {
+		t.Fatalf("result = %#v, env = %#v, command = %q %#v", result, gotEnv, gotName, gotArgs)
 	}
 }
+
+func TestRunInstallerReportsRunningAndCompletion(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "setup.exe")
+	if err := os.WriteFile(path, nil, 0600); err != nil {
+		t.Fatal(err)
+	}
+	done := make(chan struct{})
+	statuses := make(chan InstallerStatus, 1)
+	var gotEnv []string
+	app := &App{
+		startEnv: func(_ context.Context, env []string, _ string, _ ...string) (CommandProcess, error) {
+			gotEnv = env
+			return blockingProcess{done: done}, nil
+		},
+		emit: func(_ context.Context, _ string, payload ...interface{}) {
+			statuses <- payload[0].(InstallerStatus)
+		},
+	}
+
+	result := app.RunInstaller(path)
+	if !result.Success || !strings.Contains(result.Message, "ejecución") {
+		t.Fatalf("result = %#v, want running status", result)
+	}
+	if len(gotEnv) != 1 || !strings.HasPrefix(gotEnv[0], "WINEPREFIX=") || strings.HasSuffix(gotEnv[0], ".wine") {
+		t.Fatalf("env = %#v, want common Wine prefix", gotEnv)
+	}
+
+	close(done)
+	select {
+	case status := <-statuses:
+		if status.Status != "completed" {
+			t.Fatalf("status = %#v, want completed", status)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("installer completion was not reported")
+	}
+}
+
+type blockingProcess struct{ done <-chan struct{} }
+
+func (p blockingProcess) Wait() error {
+	<-p.done
+	return nil
+}
+
+type fakeProcess struct{}
+
+func (fakeProcess) Wait() error { return nil }
 
 func TestDetectWineUsesRunner(t *testing.T) {
 	called := false

@@ -1,5 +1,6 @@
 import { useEffect, useState } from 'react'
 import { CreateShortcut, InstallWine, RunInstaller, RunTarget, SelectExecutable, SelectIcon, SelectInstaller, WineStatus } from '../wailsjs/go/main/App'
+import { EventsOn } from '../wailsjs/runtime/runtime'
 
 type Result = { success: boolean; message: string; output?: string }
 type Wine = { installed: boolean; version: string; message: string }
@@ -32,12 +33,17 @@ function App() {
   const [wineChecked, setWineChecked] = useState(false)
   const [busy, setBusy] = useState(false)
   const [notice, setNotice] = useState<Result | null>(null)
+  const [installerStatus, setInstallerStatus] = useState('')
 
   const refreshWine = async () => {
     try { setWine(await WineStatus()) } catch { setWine({ installed: false, version: '', message: 'No se pudo consultar Wine.' }) }
     finally { setWineChecked(true) }
   }
   useEffect(() => { void refreshWine() }, [])
+  useEffect(() => EventsOn('installer-status', (status: { status: string; message: string }) => {
+    setInstallerStatus(status.status)
+    setNotice({ success: status.status === 'completed', message: status.message })
+  }), [])
 
   const run = async (operation: () => Promise<Result>) => {
     setBusy(true); setNotice(null)
@@ -67,14 +73,16 @@ function App() {
   const runWithShortcut = async (targetPath: string, label: string): Promise<Result> => {
     if (!name.trim()) return { success: false, message: 'Ingresá un nombre visible antes de ejecutar.' }
     if (!targetPath.trim()) return { success: false, message: `Seleccioná el ejecutable ${label} antes de ejecutar.` }
+    const launched = await RunTarget(targetPath)
+    if (!launched.success) return launched
     const shortcut = await CreateShortcut({ installerPath: installer, targetPath, name, iconPath: icon })
-    if (!shortcut.success) return shortcut
-    return RunTarget(targetPath)
+    if (!shortcut.success) return { success: true, message: `${launched.message} La aplicación se abrió, pero no se pudo crear el acceso directo.` }
+    return { success: true, message: `${launched.message} Acceso directo creado en el Escritorio.` }
   }
 
   const execute = async (): Promise<Result> => {
     if (mode === 'portable') return runWithShortcut(installer, 'portable')
-    if (mode === 'installer' && !target.trim()) return RunInstaller(installer)
+    if (mode === 'installer' && !target.trim()) { setInstallerStatus('running'); return RunInstaller(installer) }
     return runWithShortcut(target, 'instalado')
   }
 
@@ -107,7 +115,7 @@ function App() {
             <fieldset className="mode-grid">
               <legend className="sr-only">Modo de uso</legend>
               <label className={`mode-card ${mode === 'portable' ? 'selected' : ''} ${isMsi ? 'disabled' : ''}`}><input type="radio" name="mode" value="portable" checked={mode === 'portable'} disabled={isMsi} onChange={() => { setMode('portable'); setTarget(installer) }} /><span className="mode-icon"><Icon name="launch" size={19} /></span><span><strong>Aplicación portable</strong><small>Ejecutar este archivo directamente</small></span><span className="radio-indicator"><Icon name="check" size={13} /></span></label>
-              <label className={`mode-card ${mode === 'installer' ? 'selected' : ''}`}><input type="radio" name="mode" value="installer" checked={mode === 'installer'} onChange={() => { setMode('installer'); setTarget('') }} /><span className="mode-icon"><Icon name="file" size={19} /></span><span><strong>Instalador</strong><small>Instalar y elegir el ejecutable final</small></span><span className="radio-indicator"><Icon name="check" size={13} /></span></label>
+              <label className={`mode-card ${mode === 'installer' ? 'selected' : ''}`}><input type="radio" name="mode" value="installer" checked={mode === 'installer'} onChange={() => { setMode('installer'); setTarget(''); setInstallerStatus('') }} /><span className="mode-icon"><Icon name="file" size={19} /></span><span><strong>Instalador</strong><small>Instalar y elegir el ejecutable final</small></span><span className="radio-indicator"><Icon name="check" size={13} /></span></label>
             </fieldset>
           </div>
 
@@ -117,15 +125,15 @@ function App() {
             <label className="field"><span>Icono <em>Opcional</em></span><div className="input-action"><input readOnly value={icon} placeholder="Ningún icono seleccionado" /><button onClick={selectIcon} aria-label="Elegir icono">Elegir</button></div></label>
           </div>
 
-          {mode === 'installer' && <div className="target-panel"><div className="target-heading"><span className="target-icon"><Icon name="folder" size={18} /></span><div><strong>Ejecutable instalado</strong><p>Elegí el archivo que querés abrir después de instalar.</p></div></div><div className="input-action"><input readOnly value={target} placeholder="Ningún ejecutable seleccionado" /><button onClick={selectExecutable}>Elegir archivo</button></div></div>}
+           {mode === 'installer' && <div className="target-panel"><div className="target-heading"><span className="target-icon"><Icon name="folder" size={18} /></span><div><strong>Ejecutable instalado</strong><p>Los programas quedan dentro de $HOME/programas/drive_c. El EXE original no se copia automáticamente; cada instalador decide su subruta.</p></div></div><div className="input-action"><input readOnly value={target} placeholder="Ningún ejecutable seleccionado" /><button onClick={selectExecutable}>Elegir archivo</button></div></div>}
 
           <div className="divider" />
-          <div className="launch-section"><div className="launch-heading"><span className="step-number">03</span><div><h3>{mode === 'installer' && !target ? 'Listo para instalar' : 'Listo para ejecutar'}</h3><p>{mode === 'installer' && !target ? 'Instalá la aplicación para elegir el ejecutable final.' : 'El acceso directo se crea automáticamente antes de abrir la aplicación.'}</p></div></div><div className="launch-bar"><div className="launch-file"><span className="launch-file-icon"><Icon name="file" size={17} /></span><span>{mode === 'installer' && target ? target.split(/[\\/]/).pop() : fileName}</span></div>{(mode === 'portable' || mode === 'installer') && <button onClick={() => void run(execute)} disabled={busy || !wine.installed || (requiresName && !name.trim())} className="primary-action"><Icon name="launch" size={17} />{mode === 'portable' ? 'Ejecutar aplicación' : target ? 'Ejecutar aplicación instalada' : 'Instalar aplicación'}</button>}</div></div>
+           <div className="launch-section"><div className="launch-heading"><span className="step-number">03</span><div><h3>{mode === 'installer' && !target ? (installerStatus === 'running' ? 'Instalador en ejecución' : 'Listo para instalar') : 'Listo para ejecutar'}</h3><p>{mode === 'installer' && !target ? 'Wine instala dentro de $HOME/programas/drive_c. El EXE original no se copia automáticamente; después seleccioná el ejecutable instalado y se creará el acceso directo.' : 'La aplicación se abre primero; después se intenta crear el acceso directo.'}</p></div></div><div className="launch-bar"><div className="launch-file"><span className="launch-file-icon"><Icon name="file" size={17} /></span><span>{mode === 'installer' && target ? target.split(/[\\/]/).pop() : fileName}</span></div>{(mode === 'portable' || mode === 'installer') && <button onClick={() => void run(execute)} disabled={busy || !wine.installed || (requiresName && !name.trim()) || installerStatus === 'running'} className="primary-action"><Icon name="launch" size={17} />{mode === 'portable' ? 'Ejecutar aplicación' : target ? 'Ejecutar aplicación instalada' : 'Ejecutar instalador'}</button>}</div></div>
         </>}
       </section>
 
       {wineChecked && !wine.installed && <div className="wine-alert"><span className="wine-alert-icon"><Icon name="wine" size={20} /></span><div><strong>Wine no está instalado</strong><p>{wine.message}{wine.version && ` · ${wine.version}`}</p></div><button onClick={() => void run(async () => { const result = await InstallWine(); if (result.success) await refreshWine(); return result })} disabled={busy}>Instalar Wine</button></div>}
-      {notice && <div className={`notice ${notice.success ? 'success' : 'error'}`} role="status"><span className="notice-icon"><Icon name={notice.success ? 'check' : 'spark'} size={17} /></span><p><strong>{notice.success ? 'Listo' : 'Error'}</strong>{notice.message}</p></div>}
+      {notice && <div className={`notice ${notice.success ? 'success' : 'error'}`} role="status"><span className="notice-icon"><Icon name={notice.success ? 'check' : 'spark'} size={17} /></span><p><strong>{notice.success ? 'Estado' : 'Error'}</strong>{notice.message}</p></div>}
     </div>
   </main>
 }

@@ -11,12 +11,18 @@ import (
 )
 
 type App struct {
-	ctx   context.Context
-	run   CommandRunner
-	start CommandStarter
+	ctx      context.Context
+	run      CommandRunner
+	start    CommandStarter
+	startEnv CommandStarterWithEnv
+	emit     EventEmitter
 }
 
-func NewApp() *App { return &App{run: defaultCommandRunner, start: defaultCommandStarter} }
+type EventEmitter func(context.Context, string, ...interface{})
+
+func NewApp() *App {
+	return &App{run: defaultCommandRunner, start: defaultCommandStarter, startEnv: defaultCommandStarterWithEnv, emit: wailsRuntime.EventsEmit}
+}
 
 func (a *App) startup(ctx context.Context) { a.ctx = ctx }
 
@@ -82,21 +88,48 @@ func (a *App) RunInstaller(path string) OperationResult {
 	if err != nil {
 		return OperationResult{Message: err.Error()}
 	}
-	return a.startWineCommand(command, "instalador")
+	env, err := wineEnvironment()
+	if err != nil {
+		return OperationResult{Message: err.Error()}
+	}
+	process, err := a.startEnv(a.commandContext(), env, command[0], command[1:]...)
+	if err != nil {
+		return OperationResult{Message: fmt.Sprintf("No se pudo iniciar el instalador: %v", err)}
+	}
+	go a.waitForInstaller(process)
+	return OperationResult{Success: true, Message: "El instalador está en ejecución. Completá la instalación en la ventana de Wine; los programas quedan dentro de $HOME/programas/drive_c y el EXE original no se copia automáticamente."}
 }
 
 func (a *App) RunTarget(path string) OperationResult {
 	if err := validateTargetPath(path); err != nil {
 		return OperationResult{Message: err.Error()}
 	}
-	return a.startWineCommand([]string{"wine", path}, "ejecutable")
+	env, err := wineEnvironment()
+	if err != nil {
+		return OperationResult{Message: err.Error()}
+	}
+	return a.startWineCommand(env, []string{"wine", path}, "ejecutable")
 }
 
-func (a *App) startWineCommand(command []string, label string) OperationResult {
-	if err := a.start(a.commandContext(), command[0], command[1:]...); err != nil {
+func (a *App) startWineCommand(env []string, command []string, label string) OperationResult {
+	if _, err := a.startEnv(a.commandContext(), env, command[0], command[1:]...); err != nil {
 		return OperationResult{Message: fmt.Sprintf("No se pudo iniciar el %s: %v", label, err)}
 	}
 	return OperationResult{Success: true, Message: fmt.Sprintf("El %s se inició con Wine.", label)}
+}
+
+func (a *App) waitForInstaller(process CommandProcess) {
+	if err := process.Wait(); err != nil {
+		a.emit(a.commandContext(), "installer-status", InstallerStatus{
+			Status:  "failed",
+			Message: fmt.Sprintf("El instalador falló o fue cancelado: %v. Si creó una aplicación, seleccioná el EXE instalado.", err),
+		})
+		return
+	}
+	a.emit(a.commandContext(), "installer-status", InstallerStatus{
+		Status:  "completed",
+		Message: "El instalador finalizó correctamente. Los programas quedan dentro de $HOME/programas/drive_c; el instalador decide la subruta y el EXE original no se copia automáticamente. Seleccioná abajo el EXE instalado.",
+	})
 }
 
 func (a *App) CreateShortcut(req DesktopRequest) OperationResult {

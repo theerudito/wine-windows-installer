@@ -1,3 +1,5 @@
 frontend/node_modules/
 build/bin/
 frontend/dist/assets/
+*.deb
+.atl

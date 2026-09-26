@@ -105,6 +105,7 @@ rm -f "$OUTPUT_FILE"
 
 mkdir -p "$STAGING_DIR/DEBIAN"
 mkdir -p "$STAGING_DIR/usr/bin"
+mkdir -p "$STAGING_DIR/usr/lib/$PACKAGE_NAME"
 mkdir -p "$STAGING_DIR/usr/share/applications"
 mkdir -p "$STAGING_DIR/usr/share/icons/hicolor/256x256/apps"
 mkdir -p "$OUTPUT_DIR"
@@ -124,7 +125,7 @@ Architecture: $ARCH
 Depends: libgtk-3-0, libwebkit2gtk-4.1-0
 Maintainer: Jorge Loor <erudito.tv@gmail.com>
 Description: Windows Installer
- Desktop application for inspecting Android devices using ADB.
+ Desktop application for running Windows installers with Wine.
 EOF
 
 # --------------------------------------
@@ -138,7 +139,7 @@ cat > "$STAGING_DIR/usr/share/applications/$PACKAGE_NAME.desktop" <<EOF
 Type=Application
 Version=1.0
 Name=$APP_NAME
-Comment=Inspect Android devices using ADB
+Comment=Run Windows installers with Wine
 Exec=/usr/bin/$PACKAGE_NAME
 Icon=$PACKAGE_NAME
 Terminal=false
@@ -154,7 +155,16 @@ echo "==> Copiando ejecutable..."
 
 install -m 0755 \
     "$BINARY" \
-    "$STAGING_DIR/usr/bin/$PACKAGE_NAME"
+    "$STAGING_DIR/usr/lib/$PACKAGE_NAME/$PACKAGE_NAME-bin"
+
+# Launch through a clean environment. This prevents GTK/Snap variables
+# inherited from development tools from loading incompatible libraries.
+cat > "$STAGING_DIR/usr/bin/$PACKAGE_NAME" <<EOF
+#!/bin/sh
+unset GTK_PATH GTK_EXE_PREFIX GTK_IM_MODULE_FILE GTK_MODULES
+exec /usr/lib/$PACKAGE_NAME/$PACKAGE_NAME-bin "\$@"
+EOF
+chmod 0755 "$STAGING_DIR/usr/bin/$PACKAGE_NAME"
 
 # --------------------------------------
 # COPIAR ICONO

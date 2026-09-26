@@ -22,7 +22,12 @@ var (
 )
 
 type CommandRunner func(ctx context.Context, name string, args ...string) ([]byte, error)
-type CommandStarter func(ctx context.Context, name string, args ...string) error
+type CommandProcess interface {
+	Wait() error
+}
+
+type CommandStarter func(ctx context.Context, name string, args ...string) (CommandProcess, error)
+type CommandStarterWithEnv func(ctx context.Context, env []string, name string, args ...string) (CommandProcess, error)
 
 type WineStatus struct {
 	Installed bool   `json:"installed"`
@@ -34,6 +39,11 @@ type OperationResult struct {
 	Success bool   `json:"success"`
 	Message string `json:"message"`
 	Output  string `json:"output,omitempty"`
+}
+
+type InstallerStatus struct {
+	Status  string `json:"status"`
+	Message string `json:"message"`
 }
 
 type DesktopRequest struct {
@@ -133,6 +143,33 @@ func containsControlCharacter(value string) bool {
 	return false
 }
 
+func winePrefixForHome(home string) (string, error) {
+	if strings.TrimSpace(home) == "" {
+		return "", errors.New("no se pudo determinar el directorio personal del usuario")
+	}
+	prefix := filepath.Join(home, "programas")
+	if err := os.MkdirAll(prefix, 0755); err != nil {
+		return "", fmt.Errorf("no se pudo preparar el prefijo de Wine: %w", err)
+	}
+	return prefix, nil
+}
+
+func winePrefix() (string, error) {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return "", fmt.Errorf("no se pudo determinar el directorio personal del usuario: %w", err)
+	}
+	return winePrefixForHome(home)
+}
+
+func wineEnvironment() ([]string, error) {
+	prefix, err := winePrefix()
+	if err != nil {
+		return nil, err
+	}
+	return []string{"WINEPREFIX=" + prefix}, nil
+}
+
 func installerCommand(path string) ([]string, error) {
 	if err := validateInstallerPath(path); err != nil {
 		return nil, err
@@ -158,6 +195,14 @@ func desktopExecArg(value string) string {
 }
 
 func desktopEntry(req DesktopRequest) (string, string, error) {
+	prefix, err := winePrefix()
+	if err != nil {
+		return "", "", err
+	}
+	return desktopEntryWithPrefix(req, prefix)
+}
+
+func desktopEntryWithPrefix(req DesktopRequest, prefix string) (string, string, error) {
 	if err := validateInstallerPath(req.InstallerPath); err != nil {
 		return "", "", err
 	}
@@ -170,7 +215,7 @@ func desktopEntry(req DesktopRequest) (string, string, error) {
 	if err := validateIconPath(req.IconPath); err != nil {
 		return "", "", err
 	}
-	execLine := "wine " + desktopExecArg(req.TargetPath)
+	execLine := "env " + desktopExecArg("WINEPREFIX="+prefix) + " wine " + desktopExecArg(req.TargetPath)
 	icon := ""
 	if req.IconPath != "" {
 		icon = "\nIcon=" + req.IconPath
@@ -219,8 +264,21 @@ func defaultCommandRunner(ctx context.Context, name string, args ...string) ([]b
 	return exec.CommandContext(ctx, name, args...).CombinedOutput()
 }
 
-func defaultCommandStarter(ctx context.Context, name string, args ...string) error {
-	return exec.CommandContext(ctx, name, args...).Start()
+func defaultCommandStarter(ctx context.Context, name string, args ...string) (CommandProcess, error) {
+	command := exec.CommandContext(ctx, name, args...)
+	if err := command.Start(); err != nil {
+		return nil, err
+	}
+	return command, nil
+}
+
+func defaultCommandStarterWithEnv(ctx context.Context, env []string, name string, args ...string) (CommandProcess, error) {
+	command := exec.CommandContext(ctx, name, args...)
+	command.Env = append(os.Environ(), env...)
+	if err := command.Start(); err != nil {
+		return nil, err
+	}
+	return command, nil
 }
 
 func detectWine(ctx context.Context, run CommandRunner) WineStatus {
