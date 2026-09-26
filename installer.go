@@ -2,12 +2,14 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"sort"
 	"strings"
 	"unicode"
 )
@@ -15,18 +17,11 @@ import (
 var (
 	errEmptyInstaller   = errors.New("seleccioná un archivo .exe o .msi")
 	errInvalidInstaller = errors.New("el archivo debe tener extensión .exe o .msi")
-	errEmptyTarget      = errors.New("seleccioná el ejecutable destino")
-	errInvalidTarget    = errors.New("el destino debe ser un archivo .exe")
 	errInvalidName      = errors.New("el nombre debe tener entre 1 y 80 caracteres y no contener saltos de línea ni separadores")
-	errEmptyDesktop     = errors.New("no se encontró la carpeta Escritorio del usuario")
 )
 
 type CommandRunner func(ctx context.Context, name string, args ...string) ([]byte, error)
-type CommandProcess interface {
-	Wait() error
-}
-
-type CommandStarter func(ctx context.Context, name string, args ...string) (CommandProcess, error)
+type CommandProcess interface{ Wait() error }
 type CommandStarterWithEnv func(ctx context.Context, env []string, name string, args ...string) (CommandProcess, error)
 
 type WineStatus struct {
@@ -34,23 +29,36 @@ type WineStatus struct {
 	Version   string `json:"version"`
 	Message   string `json:"message"`
 }
-
 type OperationResult struct {
 	Success bool   `json:"success"`
 	Message string `json:"message"`
 	Output  string `json:"output,omitempty"`
 }
-
 type InstallerStatus struct {
 	Status  string `json:"status"`
 	Message string `json:"message"`
 }
 
-type DesktopRequest struct {
+type InstallRequest struct {
 	InstallerPath string `json:"installerPath"`
-	TargetPath    string `json:"targetPath"`
 	Name          string `json:"name"`
 	IconPath      string `json:"iconPath"`
+}
+
+type appConfig struct {
+	Name   string `json:"name"`
+	Target string `json:"target"`
+	Prefix string `json:"prefix"`
+	Icon   string `json:"icon"`
+}
+
+func containsControlCharacter(value string) bool {
+	for _, r := range value {
+		if unicode.IsControl(r) {
+			return true
+		}
+	}
+	return false
 }
 
 func validateInstallerPath(path string) error {
@@ -67,35 +75,12 @@ func validateInstallerPath(path string) error {
 	info, err := os.Stat(path)
 	if err != nil {
 		if os.IsNotExist(err) {
-			return fmt.Errorf("el archivo seleccionado no existe")
+			return errors.New("el archivo seleccionado no existe")
 		}
 		return fmt.Errorf("no se pudo acceder al archivo: %w", err)
 	}
 	if !info.Mode().IsRegular() {
 		return errors.New("el archivo seleccionado no es un archivo regular")
-	}
-	return nil
-}
-
-func validateTargetPath(path string) error {
-	if strings.TrimSpace(path) == "" {
-		return errEmptyTarget
-	}
-	if containsControlCharacter(path) {
-		return errors.New("la ruta del ejecutable contiene caracteres no permitidos")
-	}
-	if !strings.EqualFold(filepath.Ext(path), ".exe") {
-		return errInvalidTarget
-	}
-	info, err := os.Stat(path)
-	if err != nil {
-		if os.IsNotExist(err) {
-			return errors.New("el ejecutable seleccionado no existe")
-		}
-		return fmt.Errorf("no se pudo acceder al ejecutable: %w", err)
-	}
-	if !info.Mode().IsRegular() {
-		return errors.New("el ejecutable seleccionado no es un archivo regular")
 	}
 	return nil
 }
@@ -134,40 +119,33 @@ func validateDesktopName(name string) error {
 	return nil
 }
 
-func containsControlCharacter(value string) bool {
-	for _, r := range value {
-		if unicode.IsControl(r) {
-			return true
-		}
-	}
-	return false
-}
-
 func winePrefixForHome(home string) (string, error) {
 	if strings.TrimSpace(home) == "" {
 		return "", errors.New("no se pudo determinar el directorio personal del usuario")
 	}
-	prefix := filepath.Join(home, "programas")
-	if err := os.MkdirAll(prefix, 0755); err != nil {
+	p := filepath.Join(home, "programas")
+	if err := os.MkdirAll(p, 0755); err != nil {
 		return "", fmt.Errorf("no se pudo preparar el prefijo de Wine: %w", err)
 	}
-	return prefix, nil
+	return p, nil
 }
-
 func winePrefix() (string, error) {
-	home, err := os.UserHomeDir()
+	home, err := userHomeDir()
 	if err != nil {
 		return "", fmt.Errorf("no se pudo determinar el directorio personal del usuario: %w", err)
 	}
 	return winePrefixForHome(home)
 }
 
+var userHomeDir = os.UserHomeDir
+
+func wineEnvironmentForPrefix(prefix string) []string { return []string{"WINEPREFIX=" + prefix} }
 func wineEnvironment() ([]string, error) {
-	prefix, err := winePrefix()
+	p, err := winePrefix()
 	if err != nil {
 		return nil, err
 	}
-	return []string{"WINEPREFIX=" + prefix}, nil
+	return wineEnvironmentForPrefix(p), nil
 }
 
 func installerCommand(path string) ([]string, error) {
@@ -180,51 +158,6 @@ func installerCommand(path string) ([]string, error) {
 	return []string{"wine", path}, nil
 }
 
-func desktopExecArg(value string) string {
-	var b strings.Builder
-	b.WriteByte('"')
-	for _, r := range value {
-		switch r {
-		case '\\', '"', '`', '$':
-			b.WriteByte('\\')
-		}
-		b.WriteRune(r)
-	}
-	b.WriteByte('"')
-	return b.String()
-}
-
-func desktopEntry(req DesktopRequest) (string, string, error) {
-	prefix, err := winePrefix()
-	if err != nil {
-		return "", "", err
-	}
-	return desktopEntryWithPrefix(req, prefix)
-}
-
-func desktopEntryWithPrefix(req DesktopRequest, prefix string) (string, string, error) {
-	if err := validateInstallerPath(req.InstallerPath); err != nil {
-		return "", "", err
-	}
-	if err := validateTargetPath(req.TargetPath); err != nil {
-		return "", "", err
-	}
-	if err := validateDesktopName(req.Name); err != nil {
-		return "", "", err
-	}
-	if err := validateIconPath(req.IconPath); err != nil {
-		return "", "", err
-	}
-	execLine := "env " + desktopExecArg("WINEPREFIX="+prefix) + " wine " + desktopExecArg(req.TargetPath)
-	icon := ""
-	if req.IconPath != "" {
-		icon = "\nIcon=" + req.IconPath
-	}
-	content := fmt.Sprintf("[Desktop Entry]\nType=Application\nVersion=1.0\nName=%s\nExec=%s%s\nTerminal=false\nCategories=Utility;\n", req.Name, execLine, icon)
-	filename := safeDesktopFilename(req.Name)
-	return filename, content, nil
-}
-
 func safeDesktopFilename(name string) string {
 	var b strings.Builder
 	for _, r := range strings.ToLower(strings.TrimSpace(name)) {
@@ -234,44 +167,145 @@ func safeDesktopFilename(name string) string {
 			b.WriteByte('-')
 		}
 	}
-	filename := strings.Trim(b.String(), "-")
-	if filename == "" {
-		filename = "windows-installer"
+	result := strings.Trim(b.String(), "-")
+	if result == "" {
+		result = "windows-installer"
 	}
-	return filename + ".desktop"
+	return result + ".desktop"
+}
+func safeAppDirectory(name string) string {
+	return strings.TrimSuffix(safeDesktopFilename(name), ".desktop")
+}
+func desktopExecArg(value string) string {
+	var b strings.Builder
+	b.WriteByte('"')
+	for _, r := range value {
+		if r == '\\' || r == '"' || r == '`' || r == '$' {
+			b.WriteByte('\\')
+		}
+		b.WriteRune(r)
+	}
+	b.WriteByte('"')
+	return b.String()
 }
 
-func writeDesktopEntry(home string, req DesktopRequest) (string, error) {
-	filename, content, err := desktopEntry(req)
+func desktopEntryContent(req InstallRequest, target, prefix, icon string) string {
+	return fmt.Sprintf("[Desktop Entry]\nType=Application\nVersion=1.0\nName=%s\nExec=env %s wine %s\nIcon=%s\nTerminal=false\nCategories=Utility;\n", strings.TrimSpace(req.Name), desktopExecArg("WINEPREFIX="+prefix), desktopExecArg(target), icon)
+}
+
+func copyIcon(source, appDir string) (string, error) {
+	if strings.TrimSpace(source) == "" {
+		return "application-x-executable", nil
+	}
+	data, err := os.ReadFile(source)
+	if err != nil {
+		return "", fmt.Errorf("no se pudo copiar el icono: %w", err)
+	}
+	ext := strings.ToLower(filepath.Ext(source))
+	destination := filepath.Join(appDir, "icon"+ext)
+	if err := os.WriteFile(destination, data, 0644); err != nil {
+		return "", fmt.Errorf("no se pudo guardar el icono: %w", err)
+	}
+	return destination, nil
+}
+
+func writeAppFiles(home string, req InstallRequest, target, prefix string) (string, error) {
+	appDir := filepath.Join(prefix, safeAppDirectory(req.Name))
+	if err := os.MkdirAll(appDir, 0755); err != nil {
+		return "", fmt.Errorf("no se pudo preparar la configuración: %w", err)
+	}
+	icon, err := copyIcon(req.IconPath, appDir)
 	if err != nil {
 		return "", err
 	}
-	desktopDir := filepath.Join(home, "Desktop")
-	if info, statErr := os.Stat(desktopDir); statErr != nil || !info.IsDir() {
-		return "", errEmptyDesktop
+	config := appConfig{Name: strings.TrimSpace(req.Name), Target: target, Prefix: prefix, Icon: icon}
+	data, err := json.MarshalIndent(config, "", "  ")
+	if err != nil {
+		return "", err
 	}
-	path := filepath.Join(desktopDir, filename)
-	if err := os.WriteFile(path, []byte(content), 0755); err != nil {
+	if err := os.WriteFile(filepath.Join(appDir, "config.json"), append(data, '\n'), 0644); err != nil {
+		return "", fmt.Errorf("no se pudo guardar la configuración: %w", err)
+	}
+	content := desktopEntryContent(req, target, prefix, icon)
+	filename := safeDesktopFilename(req.Name)
+	applications := filepath.Join(home, ".local", "share", "applications")
+	if err := os.MkdirAll(applications, 0755); err != nil {
+		return "", err
+	}
+	shortcut := filepath.Join(applications, filename)
+	if err := os.WriteFile(shortcut, []byte(content), 0755); err != nil {
 		return "", fmt.Errorf("no se pudo crear el acceso directo: %w", err)
 	}
-	if err := os.Chmod(path, 0755); err != nil {
-		return "", fmt.Errorf("no se pudieron establecer permisos del acceso directo: %w", err)
+	if desktop := filepath.Join(home, "Desktop"); func() bool { info, e := os.Stat(desktop); return e == nil && info.IsDir() }() {
+		if err := os.WriteFile(filepath.Join(desktop, filename), []byte(content), 0755); err != nil {
+			return "", fmt.Errorf("no se pudo copiar el acceso directo al Escritorio: %w", err)
+		}
 	}
-	return path, nil
+	return shortcut, nil
 }
 
+func discoverInstalledExecutable(prefix string, before map[string]struct{}) (string, int) {
+	root := filepath.Join(prefix, "drive_c")
+	var candidates []string
+	_ = filepath.WalkDir(root, func(path string, entry os.DirEntry, err error) error {
+		if err != nil {
+			return nil
+		}
+		if entry.IsDir() {
+			lower := strings.ToLower(filepath.Base(path))
+			if path != root && (lower == "windows" || lower == "system32" || lower == "syswow64" || lower == "$recycle.bin") {
+				return filepath.SkipDir
+			}
+			return nil
+		}
+		if !strings.EqualFold(filepath.Ext(path), ".exe") || strings.EqualFold(filepath.Base(path), "uninstall.exe") || strings.Contains(strings.ToLower(path), "uninstall") {
+			return nil
+		}
+		if _, existed := before[path]; existed {
+			return nil
+		}
+		candidates = append(candidates, path)
+		return nil
+	})
+	sort.Slice(candidates, func(i, j int) bool {
+		score := func(p string) int {
+			l := strings.ToLower(p)
+			if strings.Contains(l, "program files") {
+				return 0
+			}
+			if strings.Contains(l, "programfiles") {
+				return 0
+			}
+			if strings.Contains(l, "program files (x86)") {
+				return 1
+			}
+			return 2
+		}
+		si, sj := score(candidates[i]), score(candidates[j])
+		if si != sj {
+			return si < sj
+		}
+		return candidates[i] < candidates[j]
+	})
+	if len(candidates) == 1 {
+		return candidates[0], 1
+	}
+	return "", len(candidates)
+}
+
+func snapshotExecutables(prefix string) map[string]struct{} {
+	result := map[string]struct{}{}
+	_ = filepath.WalkDir(filepath.Join(prefix, "drive_c"), func(path string, entry os.DirEntry, err error) error {
+		if err == nil && entry != nil && !entry.IsDir() && strings.EqualFold(filepath.Ext(path), ".exe") {
+			result[path] = struct{}{}
+		}
+		return nil
+	})
+	return result
+}
 func defaultCommandRunner(ctx context.Context, name string, args ...string) ([]byte, error) {
 	return exec.CommandContext(ctx, name, args...).CombinedOutput()
 }
-
-func defaultCommandStarter(ctx context.Context, name string, args ...string) (CommandProcess, error) {
-	command := exec.CommandContext(ctx, name, args...)
-	if err := command.Start(); err != nil {
-		return nil, err
-	}
-	return command, nil
-}
-
 func defaultCommandStarterWithEnv(ctx context.Context, env []string, name string, args ...string) (CommandProcess, error) {
 	command := exec.CommandContext(ctx, name, args...)
 	command.Env = append(os.Environ(), env...)
@@ -280,7 +314,6 @@ func defaultCommandStarterWithEnv(ctx context.Context, env []string, name string
 	}
 	return command, nil
 }
-
 func detectWine(ctx context.Context, run CommandRunner) WineStatus {
 	if runtime.GOOS != "linux" {
 		return WineStatus{Message: "WindowsInstaller está pensado para Ubuntu/Linux."}

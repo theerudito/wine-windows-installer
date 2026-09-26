@@ -1,19 +1,17 @@
 export namespace main {
 	
-	export class DesktopRequest {
+	export class InstallRequest {
 	    installerPath: string;
-	    targetPath: string;
 	    name: string;
 	    iconPath: string;
 	
 	    static createFrom(source: any = {}) {
-	        return new DesktopRequest(source);
+	        return new InstallRequest(source);
 	    }
 	
 	    constructor(source: any = {}) {
 	        if ('string' === typeof source) source = JSON.parse(source);
 	        this.installerPath = source["installerPath"];
-	        this.targetPath = source["targetPath"];
 	        this.name = source["name"];
 	        this.iconPath = source["iconPath"];
 	    }
