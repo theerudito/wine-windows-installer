@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"os"
 	"path/filepath"
 	"strings"
@@ -58,7 +59,7 @@ func TestCopyPortableExecutableUsesApplicationDirectoryAndSafeTarget(t *testing.
 		t.Fatalf("source executable changed: %q, err = %v", original, err)
 	}
 	entry := desktopEntryContent("Mi App", target, prefix)
-	if !strings.Contains(entry, "wine \""+target+"\"") {
+	if !strings.Contains(entry, "wine "+desktopExecArg(target)) {
 		t.Fatalf("desktop target = %s", entry)
 	}
 }
@@ -136,7 +137,7 @@ func TestWriteAppFilesPersistsIconAndDesktop(t *testing.T) {
 		t.Fatalf("desktop entry missing startup notification: %s", text)
 	}
 	config, err := os.ReadFile(filepath.Join(prefix, "mi-app", "config.json"))
-	if err != nil || !strings.Contains(string(config), `"target": "`+target+`"`) || !strings.Contains(string(config), `"prefix": "`+prefix+`"`) {
+	if err != nil || !strings.Contains(string(config), filepath.Base(target)) || !strings.Contains(string(config), filepath.Base(prefix)) {
 		t.Fatalf("app config = %s, err = %v", config, err)
 	}
 }
@@ -189,29 +190,179 @@ func TestInstallUsesWinePrefixAndMSIArguments(t *testing.T) {
 	}
 }
 
-func TestApplicationNameIsDerivedWithoutExtension(t *testing.T) {
-	if got := applicationName(filepath.Join("/tmp", "Mi.App.msi")); got != "Mi.App" {
-		t.Fatalf("application name = %q", got)
-	}
-}
-
-func TestUninstallUsesWinePrefixAndOfficialCommand(t *testing.T) {
+func TestRunPortableUsesWinePrefixAndSelectedExecutable(t *testing.T) {
 	home := t.TempDir()
 	old := userHomeDir
 	userHomeDir = func() (string, error) { return home, nil }
 	t.Cleanup(func() { userHomeDir = old })
+	path := filepath.Join(home, "portable.exe")
+	if err := os.WriteFile(path, nil, 0600); err != nil {
+		t.Fatal(err)
+	}
 	var gotName string
 	var gotArgs, gotEnv []string
 	app := &App{startEnv: func(_ context.Context, env []string, name string, args ...string) (CommandProcess, error) {
 		gotEnv, gotName, gotArgs = env, name, args
 		return fakeProcess{}, nil
 	}, emit: func(context.Context, string, ...interface{}) {}}
-	result := app.Uninstall()
+	result := app.RunPortable(path)
+	if !result.Success {
+		t.Fatalf("result = %#v", result)
+	}
+	if gotName != "wine" || strings.Join(gotArgs, "\x00") != path || strings.Join(gotEnv, "\x00") != "WINEPREFIX="+filepath.Join(home, "programas") {
+		t.Fatalf("command=%s %#v env=%#v", gotName, gotArgs, gotEnv)
+	}
+}
+
+func TestApplicationNameIsDerivedWithoutExtension(t *testing.T) {
+	if got := applicationName(filepath.Join("/tmp", "Mi.App.msi")); got != "Mi.App" {
+		t.Fatalf("application name = %q", got)
+	}
+}
+
+func TestUninstallMSIUsesWinePrefixAndOfficialCommand(t *testing.T) {
+	home := t.TempDir()
+	old := userHomeDir
+	userHomeDir = func() (string, error) { return home, nil }
+	t.Cleanup(func() { userHomeDir = old })
+	prefix := filepath.Join(home, "programas")
+	appDir := filepath.Join(prefix, "acme")
+	if err := os.MkdirAll(appDir, 0755); err != nil {
+		t.Fatal(err)
+	}
+	config, err := json.Marshal(appConfig{Name: "Acme", Target: filepath.Join(prefix, "drive_c", "Program Files", "Acme", "Acme.exe"), Prefix: prefix, Type: "msi"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(appDir, "config.json"), config, 0644); err != nil {
+		t.Fatal(err)
+	}
+	var gotName string
+	var gotArgs, gotEnv []string
+	app := &App{startEnv: func(_ context.Context, env []string, name string, args ...string) (CommandProcess, error) {
+		gotEnv, gotName, gotArgs = env, name, args
+		return fakeProcess{}, nil
+	}, emit: func(context.Context, string, ...interface{}) {}}
+	result := app.Uninstall("acme")
 	if !result.Success {
 		t.Fatalf("result = %#v", result)
 	}
 	if gotName != "wine" || strings.Join(gotArgs, "\x00") != "uninstaller" || strings.Join(gotEnv, "\x00") != "WINEPREFIX="+filepath.Join(home, "programas") {
 		t.Fatalf("command=%s %#v env=%#v", gotName, gotArgs, gotEnv)
+	}
+}
+
+func TestListInstalledAppsReadsManagedConfigsOnly(t *testing.T) {
+	prefix := filepath.Join(t.TempDir(), "programas")
+	if err := os.MkdirAll(filepath.Join(prefix, "portable-app"), 0755); err != nil {
+		t.Fatal(err)
+	}
+	data, err := json.Marshal(appConfig{Name: "Portable App", Target: filepath.Join(prefix, "portable-app", "app.exe"), Prefix: prefix, Type: "portable"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(prefix, "portable-app", "config.json"), data, 0644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Join(prefix, "unmanaged"), 0755); err != nil {
+		t.Fatal(err)
+	}
+	apps, err := listInstalledApps(prefix)
+	if err != nil || len(apps) != 1 || apps[0].ID != "portable-app" || apps[0].Name != "Portable App" {
+		t.Fatalf("apps = %#v, err = %v", apps, err)
+	}
+}
+
+func TestListInstalledAppsReturnsEmptyForMissingPrefix(t *testing.T) {
+	apps, err := listInstalledApps(filepath.Join(t.TempDir(), "missing"))
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(apps) != 0 {
+		t.Fatalf("apps = %#v", apps)
+	}
+}
+
+func TestRemoveManagedPortableAppDoesNotTouchSibling(t *testing.T) {
+	home := t.TempDir()
+	prefix := filepath.Join(home, "programas")
+	appDir := filepath.Join(prefix, "portable-app")
+	sibling := filepath.Join(prefix, "sibling", "keep.txt")
+	if err := os.MkdirAll(filepath.Dir(sibling), 0755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(sibling, []byte("keep"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(appDir, 0755); err != nil {
+		t.Fatal(err)
+	}
+	data, err := json.Marshal(appConfig{Name: "Portable App", Target: filepath.Join(appDir, "app.exe"), Prefix: prefix, Type: "portable"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(appDir, "config.json"), data, 0644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(appDir, "app.exe"), []byte("portable"), 0755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(appDir, "user-data.txt"), []byte("keep"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	if err := removeManagedApp(home, prefix, "portable-app"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(appDir); err != nil {
+		t.Fatalf("managed app directory was removed: %v", err)
+	}
+	if _, err := os.Stat(sibling); err != nil {
+		t.Fatalf("sibling was removed: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(appDir, "user-data.txt")); err != nil {
+		t.Fatalf("unowned app file was removed: %v", err)
+	}
+}
+
+func TestRemoveManagedAppRejectsConfigNameThatTargetsAnotherShortcut(t *testing.T) {
+	home := t.TempDir()
+	prefix := filepath.Join(home, "programas")
+	appDir := filepath.Join(prefix, "portable-app")
+	if err := os.MkdirAll(appDir, 0755); err != nil {
+		t.Fatal(err)
+	}
+	data, err := json.Marshal(appConfig{Name: "Other App", Target: filepath.Join(appDir, "app.exe"), Prefix: prefix, Type: "portable"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(appDir, "config.json"), data, 0644); err != nil {
+		t.Fatal(err)
+	}
+	if err := removeManagedApp(home, prefix, "portable-app"); err == nil {
+		t.Fatal("expected mismatched managed name to be rejected")
+	}
+}
+
+func TestRemoveManagedAppRejectsSymlinkedManagedConfig(t *testing.T) {
+	home := t.TempDir()
+	prefix := filepath.Join(home, "programas")
+	appDir := filepath.Join(prefix, "portable-app")
+	outside := filepath.Join(home, "outside-config.json")
+	if err := os.MkdirAll(appDir, 0755); err != nil {
+		t.Fatal(err)
+	}
+	data, err := json.Marshal(appConfig{Name: "Portable App", Prefix: prefix})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(outside, data, 0644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(outside, filepath.Join(appDir, "config.json")); err != nil {
+		t.Skipf("symlink creation unavailable: %v", err)
+	}
+	if err := removeManagedApp(home, prefix, "portable-app"); err == nil {
+		t.Fatal("expected symlinked managed config to be rejected")
 	}
 }
 

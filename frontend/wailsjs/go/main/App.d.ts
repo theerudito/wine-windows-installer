@@ -6,8 +6,12 @@ export function Install(arg1:main.InstallRequest):Promise<main.OperationResult>;
 
 export function InstallWine():Promise<main.OperationResult>;
 
+export function ListInstalledApps():Promise<Array<main.InstalledApp>>;
+
+export function RunPortable(arg1:string):Promise<main.OperationResult>;
+
 export function SelectInstaller():Promise<string>;
 
-export function Uninstall():Promise<main.OperationResult>;
+export function Uninstall(arg1:string):Promise<main.OperationResult>;
 
 export function WineStatus():Promise<main.WineStatus>;

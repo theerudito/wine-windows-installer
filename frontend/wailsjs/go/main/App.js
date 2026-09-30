@@ -10,12 +10,20 @@ export function InstallWine() {
   return window['go']['main']['App']['InstallWine']();
 }
 
+export function ListInstalledApps() {
+  return window['go']['main']['App']['ListInstalledApps']();
+}
+
+export function RunPortable(arg1) {
+  return window['go']['main']['App']['RunPortable'](arg1);
+}
+
 export function SelectInstaller() {
   return window['go']['main']['App']['SelectInstaller']();
 }
 
-export function Uninstall() {
-  return window['go']['main']['App']['Uninstall']();
+export function Uninstall(arg1) {
+  return window['go']['main']['App']['Uninstall'](arg1);
 }
 
 export function WineStatus() {

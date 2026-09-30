@@ -86,11 +86,69 @@ func (a *App) Install(req InstallRequest) OperationResult {
 	return OperationResult{Success: true, Message: "La operación está en ejecución. Esperá a que finalice para crear el acceso directo."}
 }
 
-// Uninstall opens Wine's official uninstaller for the shared application prefix.
-func (a *App) Uninstall() OperationResult {
+func (a *App) RunPortable(path string) OperationResult {
+	if err := validateInstallerPath(path); err != nil || !strings.EqualFold(filepath.Ext(path), ".exe") {
+		if err == nil {
+			err = errInvalidInstaller
+		}
+		return OperationResult{Message: err.Error()}
+	}
 	prefix, err := winePrefix()
 	if err != nil {
 		return OperationResult{Message: err.Error()}
+	}
+	process, err := a.startEnv(a.commandContext(), wineEnvironmentForPrefix(prefix), "wine", path)
+	if err != nil {
+		return OperationResult{Message: fmt.Sprintf("No se pudo iniciar la aplicación: %v", err)}
+	}
+	go func() {
+		if err := process.Wait(); err != nil {
+			a.emit(a.commandContext(), "installer-status", InstallerStatus{Status: "failed", Message: fmt.Sprintf("La aplicación terminó con un error: %v.", err)})
+			return
+		}
+		a.emit(a.commandContext(), "installer-status", InstallerStatus{Status: "completed", Message: "La aplicación finalizó correctamente."})
+	}()
+	a.emit(a.commandContext(), "installer-status", InstallerStatus{Status: "running", Message: "La aplicación se está ejecutando con Wine."})
+	return OperationResult{Success: true, Message: "La aplicación se está ejecutando."}
+}
+
+func (a *App) ListInstalledApps() ([]InstalledApp, error) {
+	prefix, err := winePrefix()
+	if err != nil {
+		return nil, err
+	}
+	return listInstalledApps(prefix)
+}
+
+// Uninstall removes the selected managed application and opens Wine's uninstaller for MSI entries.
+func (a *App) Uninstall(id string) OperationResult {
+	prefix, err := winePrefix()
+	if err != nil {
+		return OperationResult{Message: err.Error()}
+	}
+	home, err := userHomeDir()
+	if err != nil {
+		return OperationResult{Message: err.Error()}
+	}
+	apps, err := listInstalledApps(prefix)
+	if err != nil {
+		return OperationResult{Message: err.Error()}
+	}
+	var selected InstalledApp
+	for _, app := range apps {
+		if app.ID == id {
+			selected = app
+			break
+		}
+	}
+	if selected.ID == "" {
+		return OperationResult{Message: "Seleccioná una aplicación instalada."}
+	}
+	if selected.Type != "msi" {
+		if err := removeManagedApp(home, prefix, id); err != nil {
+			return OperationResult{Message: err.Error()}
+		}
+		return OperationResult{Success: true, Message: "La aplicación se desinstaló correctamente."}
 	}
 	process, err := a.startEnv(a.commandContext(), wineEnvironmentForPrefix(prefix), "wine", "uninstaller")
 	if err != nil {
@@ -99,9 +157,11 @@ func (a *App) Uninstall() OperationResult {
 	go func() {
 		if err := process.Wait(); err != nil {
 			a.emit(a.commandContext(), "installer-status", InstallerStatus{Status: "failed", Message: fmt.Sprintf("El desinstalador terminó con un error: %v.", err)})
+			return
 		}
+		a.emit(a.commandContext(), "installer-status", InstallerStatus{Status: "completed", Message: "Se cerró el desinstalador de Wine. Comprobá allí si quitaste la aplicación seleccionada; sigue en la lista porque no se pudo verificar su desinstalación."})
 	}()
-	return OperationResult{Success: true, Message: "Se abrió el desinstalador oficial de Wine."}
+	return OperationResult{Success: true, Message: "Se abrió el desinstalador de Wine. Seleccioná allí la aplicación que quieras quitar."}
 }
 
 func (a *App) finishInstall(process CommandProcess, req InstallRequest, target, prefix string, before map[string]struct{}) {

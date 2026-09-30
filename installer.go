@@ -38,6 +38,12 @@ type InstallerStatus struct {
 	Message string `json:"message"`
 }
 
+type InstalledApp struct {
+	ID   string `json:"id"`
+	Name string `json:"name"`
+	Type string `json:"type"`
+}
+
 type InstallRequest struct {
 	InstallerPath string `json:"installerPath"`
 }
@@ -47,6 +53,7 @@ type appConfig struct {
 	Target string `json:"target"`
 	Prefix string `json:"prefix"`
 	Icon   string `json:"icon"`
+	Type   string `json:"type"`
 }
 
 func containsControlCharacter(value string) bool {
@@ -204,7 +211,11 @@ func writeAppFiles(home string, req InstallRequest, target, prefix string) (stri
 	if err := os.MkdirAll(appDir, 0755); err != nil {
 		return "", fmt.Errorf("no se pudo preparar la configuración: %w", err)
 	}
-	config := appConfig{Name: name, Target: target, Prefix: prefix, Icon: "application-x-executable"}
+	configType := "portable"
+	if strings.EqualFold(filepath.Ext(req.InstallerPath), ".msi") {
+		configType = "msi"
+	}
+	config := appConfig{Name: name, Target: target, Prefix: prefix, Icon: "application-x-executable", Type: configType}
 	data, err := json.MarshalIndent(config, "", "  ")
 	if err != nil {
 		return "", err
@@ -233,6 +244,134 @@ func writeAppFiles(home string, req InstallRequest, target, prefix string) (stri
 		return "", fmt.Errorf("no se pudo copiar el acceso directo al Escritorio: %w", err)
 	}
 	return shortcut, nil
+}
+
+func listInstalledApps(prefix string) ([]InstalledApp, error) {
+	entries, err := os.ReadDir(prefix)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return []InstalledApp{}, nil
+		}
+		return nil, fmt.Errorf("no se pudieron leer las aplicaciones instaladas: %w", err)
+	}
+	apps := make([]InstalledApp, 0)
+	for _, entry := range entries {
+		if !entry.IsDir() || entry.Name() != safeAppDirectory(entry.Name()) {
+			continue
+		}
+		config, err := managedAppConfig(prefix, entry.Name())
+		if err != nil {
+			continue
+		}
+		appType := config.Type
+		if appType == "" {
+			appType = "portable"
+			if strings.HasPrefix(filepath.Clean(config.Target), filepath.Join(prefix, "drive_c")) {
+				appType = "msi"
+			}
+		}
+		apps = append(apps, InstalledApp{ID: entry.Name(), Name: config.Name, Type: appType})
+	}
+	sort.Slice(apps, func(i, j int) bool { return strings.ToLower(apps[i].Name) < strings.ToLower(apps[j].Name) })
+	return apps, nil
+}
+
+func managedAppConfig(prefix, id string) (appConfig, error) {
+	appDir, err := managedAppDirectory(prefix, id)
+	if err != nil {
+		return appConfig{}, err
+	}
+	dirInfo, err := os.Lstat(appDir)
+	if err != nil || !dirInfo.IsDir() {
+		return appConfig{}, errors.New("la carpeta de la aplicación seleccionada no es válida")
+	}
+	configPath := filepath.Join(appDir, "config.json")
+	info, err := os.Lstat(configPath)
+	if err != nil || !info.Mode().IsRegular() {
+		return appConfig{}, errors.New("la aplicación seleccionada no tiene una configuración administrada")
+	}
+	data, err := os.ReadFile(configPath)
+	if err != nil {
+		return appConfig{}, errors.New("no se pudo leer la configuración de la aplicación")
+	}
+	var config appConfig
+	if json.Unmarshal(data, &config) != nil || config.Prefix != prefix || config.Name == "" || safeAppDirectory(config.Name) != id || (config.Type != "" && config.Type != "portable" && config.Type != "msi") {
+		return appConfig{}, errors.New("la configuración de la aplicación seleccionada no es válida")
+	}
+	return config, nil
+}
+
+func managedAppDirectory(prefix, id string) (string, error) {
+	if id == "" || filepath.Base(id) != id || id != safeAppDirectory(id) {
+		return "", errors.New("la aplicación seleccionada no es válida")
+	}
+	path := filepath.Join(prefix, id)
+	rel, err := filepath.Rel(prefix, path)
+	if err != nil || rel == "." || rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
+		return "", errors.New("la ruta de la aplicación seleccionada no es segura")
+	}
+	return path, nil
+}
+
+func removeManagedApp(home, prefix, id string) error {
+	appDir, err := managedAppDirectory(prefix, id)
+	if err != nil {
+		return err
+	}
+	config, err := managedAppConfig(prefix, id)
+	if err != nil {
+		return err
+	}
+	appType := config.Type
+	if appType == "" && strings.HasPrefix(filepath.Clean(config.Target), filepath.Join(prefix, "drive_c")) {
+		appType = "msi"
+	}
+	if appType != "msi" {
+		if filepath.Dir(config.Target) != appDir || !strings.EqualFold(filepath.Ext(config.Target), ".exe") {
+			return errors.New("el ejecutable portable no pertenece a la aplicación seleccionada")
+		}
+		info, err := os.Lstat(config.Target)
+		if err != nil || !info.Mode().IsRegular() {
+			return errors.New("el ejecutable portable no es un archivo regular administrado")
+		}
+		if err := os.Remove(config.Target); err != nil {
+			return fmt.Errorf("no se pudo quitar el ejecutable portable: %w", err)
+		}
+	}
+	if err := os.Remove(filepath.Join(appDir, "config.json")); err != nil {
+		return fmt.Errorf("no se pudo quitar la configuración: %w", err)
+	}
+	// Other files in the directory are not owned by this cleanup.
+	if entries, err := os.ReadDir(appDir); err == nil && len(entries) == 0 {
+		if err := os.Remove(appDir); err != nil {
+			return fmt.Errorf("no se pudo quitar la carpeta de la aplicación: %w", err)
+		}
+	}
+	shortcut := safeDesktopFilename(config.Name)
+	for _, dir := range []string{filepath.Join(home, ".local", "share", "applications"), filepath.Join(home, "Desktop")} {
+		path := filepath.Join(dir, shortcut)
+		info, err := os.Lstat(path)
+		if os.IsNotExist(err) {
+			continue
+		}
+		if err != nil {
+			return fmt.Errorf("no se pudo comprobar el acceso directo: %w", err)
+		}
+		if !info.Mode().IsRegular() {
+			continue
+		}
+		content, err := os.ReadFile(path)
+		if err != nil {
+			return fmt.Errorf("no se pudo leer el acceso directo: %w", err)
+		}
+		if string(content) != desktopEntryContent(config.Name, config.Target, prefix) {
+			continue
+		}
+		if err := os.Remove(path); err != nil && !os.IsNotExist(err) {
+			return fmt.Errorf("no se pudo quitar el acceso directo: %w", err)
+		}
+	}
+	return nil
 }
 
 func desktopDirectory(home string) (string, error) {
