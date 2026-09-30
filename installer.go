@@ -313,6 +313,78 @@ func managedAppDirectory(prefix, id string) (string, error) {
 	return path, nil
 }
 
+func safeMSIInstallDirectory(prefix, target string) (string, error) {
+	if strings.TrimSpace(target) == "" || !filepath.IsAbs(target) || containsControlCharacter(target) {
+		return "", errors.New("la ruta de instalación MSI no es segura")
+	}
+	driveRoot := filepath.Join(prefix, "drive_c")
+	rel, err := filepath.Rel(driveRoot, target)
+	if err != nil || rel == "." || rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
+		return "", errors.New("la ruta de instalación MSI está fuera del prefijo administrado")
+	}
+	if !strings.EqualFold(filepath.Ext(target), ".exe") {
+		return "", errors.New("la ruta de instalación MSI no identifica un ejecutable")
+	}
+	installDir := filepath.Dir(target)
+	dirRel, err := filepath.Rel(driveRoot, installDir)
+	if err != nil || dirRel == "." || dirRel == ".." || strings.HasPrefix(dirRel, ".."+string(filepath.Separator)) {
+		return "", errors.New("la carpeta de instalación MSI no es específica de la aplicación")
+	}
+	parts := strings.Split(filepath.Clean(dirRel), string(filepath.Separator))
+	if len(parts) < 2 {
+		return "", errors.New("la carpeta de instalación MSI no es específica de la aplicación")
+	}
+	for _, part := range parts {
+		switch strings.ToLower(part) {
+		case "windows", "system32", "syswow64", "program files", "program files (x86)", "common files":
+			if part == parts[len(parts)-1] {
+				return "", errors.New("la carpeta de instalación MSI no es específica de la aplicación")
+			}
+		}
+	}
+	if err := validateNoSymlinkPath(driveRoot, installDir); err != nil {
+		return "", err
+	}
+	if info, err := os.Lstat(target); err == nil {
+		if !info.Mode().IsRegular() {
+			return "", errors.New("el ejecutable MSI administrado no es un archivo regular")
+		}
+	} else if !os.IsNotExist(err) {
+		return "", fmt.Errorf("no se pudo validar el ejecutable MSI administrado: %w", err)
+	}
+	return installDir, nil
+}
+
+func validateNoSymlinkPath(root, path string) error {
+	root, err := filepath.Abs(root)
+	if err != nil {
+		return errors.New("la raíz de la aplicación no es válida")
+	}
+	path, err = filepath.Abs(path)
+	if err != nil {
+		return errors.New("la ruta de la aplicación no es válida")
+	}
+	rel, err := filepath.Rel(root, path)
+	if err != nil || rel == "." || rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
+		return errors.New("la ruta de la aplicación no es segura")
+	}
+	current := root
+	for _, part := range strings.Split(rel, string(filepath.Separator)) {
+		current = filepath.Join(current, part)
+		info, err := os.Lstat(current)
+		if os.IsNotExist(err) {
+			continue
+		}
+		if err != nil {
+			return fmt.Errorf("no se pudo validar la ruta de la aplicación: %w", err)
+		}
+		if info.Mode()&os.ModeSymlink != 0 {
+			return errors.New("la ruta de la aplicación contiene un enlace simbólico")
+		}
+	}
+	return nil
+}
+
 func removeManagedApp(home, prefix, id string) error {
 	appDir, err := managedAppDirectory(prefix, id)
 	if err != nil {
@@ -326,7 +398,13 @@ func removeManagedApp(home, prefix, id string) error {
 	if appType == "" && strings.HasPrefix(filepath.Clean(config.Target), filepath.Join(prefix, "drive_c")) {
 		appType = "msi"
 	}
-	if appType != "msi" {
+	var installDir string
+	if appType == "msi" {
+		installDir, err = safeMSIInstallDirectory(prefix, config.Target)
+		if err != nil {
+			return err
+		}
+	} else {
 		if filepath.Dir(config.Target) != appDir || !strings.EqualFold(filepath.Ext(config.Target), ".exe") {
 			return errors.New("el ejecutable portable no pertenece a la aplicación seleccionada")
 		}
@@ -334,17 +412,17 @@ func removeManagedApp(home, prefix, id string) error {
 		if err != nil || !info.Mode().IsRegular() {
 			return errors.New("el ejecutable portable no es un archivo regular administrado")
 		}
-		if err := os.Remove(config.Target); err != nil {
-			return fmt.Errorf("no se pudo quitar el ejecutable portable: %w", err)
+	}
+	if appType == "msi" {
+		if err := os.RemoveAll(installDir); err != nil {
+			return fmt.Errorf("no se pudo quitar la carpeta de instalación MSI: %w", err)
 		}
+	} else if err := os.RemoveAll(appDir); err != nil {
+		return fmt.Errorf("no se pudo quitar la carpeta de la aplicación: %w", err)
 	}
-	if err := os.Remove(filepath.Join(appDir, "config.json")); err != nil {
-		return fmt.Errorf("no se pudo quitar la configuración: %w", err)
-	}
-	// Other files in the directory are not owned by this cleanup.
-	if entries, err := os.ReadDir(appDir); err == nil && len(entries) == 0 {
-		if err := os.Remove(appDir); err != nil {
-			return fmt.Errorf("no se pudo quitar la carpeta de la aplicación: %w", err)
+	if appType == "msi" {
+		if err := os.RemoveAll(appDir); err != nil {
+			return fmt.Errorf("no se pudo quitar la configuración: %w", err)
 		}
 	}
 	shortcut := safeDesktopFilename(config.Name)

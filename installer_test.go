@@ -227,10 +227,18 @@ func TestUninstallMSIUsesWinePrefixAndOfficialCommand(t *testing.T) {
 	t.Cleanup(func() { userHomeDir = old })
 	prefix := filepath.Join(home, "programas")
 	appDir := filepath.Join(prefix, "acme")
+	installDir := filepath.Join(prefix, "drive_c", "Program Files", "Acme")
+	if err := os.MkdirAll(installDir, 0755); err != nil {
+		t.Fatal(err)
+	}
 	if err := os.MkdirAll(appDir, 0755); err != nil {
 		t.Fatal(err)
 	}
-	config, err := json.Marshal(appConfig{Name: "Acme", Target: filepath.Join(prefix, "drive_c", "Program Files", "Acme", "Acme.exe"), Prefix: prefix, Type: "msi"})
+	target := filepath.Join(installDir, "Acme.exe")
+	if err := os.WriteFile(target, nil, 0600); err != nil {
+		t.Fatal(err)
+	}
+	config, err := json.Marshal(appConfig{Name: "Acme", Target: target, Prefix: prefix, Type: "msi"})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -249,6 +257,113 @@ func TestUninstallMSIUsesWinePrefixAndOfficialCommand(t *testing.T) {
 	}
 	if gotName != "wine" || strings.Join(gotArgs, "\x00") != "uninstaller" || strings.Join(gotEnv, "\x00") != "WINEPREFIX="+filepath.Join(home, "programas") {
 		t.Fatalf("command=%s %#v env=%#v", gotName, gotArgs, gotEnv)
+	}
+}
+
+func TestRemoveManagedPortableAppRemovesEntireDirectoryAndPreservesSiblings(t *testing.T) {
+	home := t.TempDir()
+	prefix := filepath.Join(home, "programas")
+	appDir := filepath.Join(prefix, "portable-app")
+	sibling := filepath.Join(prefix, "sibling", "keep.txt")
+	if err := os.MkdirAll(filepath.Join(appDir, "nested", "deeper"), 0755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Dir(sibling), 0755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(sibling, []byte("keep"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	data, err := json.Marshal(appConfig{Name: "Portable App", Target: filepath.Join(appDir, "app.exe"), Prefix: prefix, Type: "portable"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(appDir, "config.json"), data, 0644); err != nil {
+		t.Fatal(err)
+	}
+	for _, path := range []string{filepath.Join(appDir, "app.exe"), filepath.Join(appDir, "nested", "deeper", "data.bin")} {
+		if err := os.WriteFile(path, []byte("owned"), 0644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := removeManagedApp(home, prefix, "portable-app"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(appDir); !os.IsNotExist(err) {
+		t.Fatalf("managed app directory still exists: %v", err)
+	}
+	if data, err := os.ReadFile(sibling); err != nil || string(data) != "keep" {
+		t.Fatalf("sibling was changed: %q, %v", data, err)
+	}
+}
+
+func TestRemoveManagedMSIAppRemovesInstallDirectoryAndPreservesSharedFiles(t *testing.T) {
+	home := t.TempDir()
+	prefix := filepath.Join(home, "programas")
+	appDir := filepath.Join(prefix, "acme")
+	installDir := filepath.Join(prefix, "drive_c", "Program Files", "Acme")
+	shared := filepath.Join(prefix, "drive_c", "Program Files", "Shared", "keep.dll")
+	if err := os.MkdirAll(filepath.Join(installDir, "nested"), 0755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Dir(shared), 0755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(shared, []byte("keep"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	target := filepath.Join(installDir, "Acme.exe")
+	if err := os.WriteFile(target, nil, 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(installDir, "nested", "data.dat"), []byte("owned"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(appDir, 0755); err != nil {
+		t.Fatal(err)
+	}
+	data, err := json.Marshal(appConfig{Name: "Acme", Target: target, Prefix: prefix, Type: "msi"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(appDir, "config.json"), data, 0644); err != nil {
+		t.Fatal(err)
+	}
+	if err := removeManagedApp(home, prefix, "acme"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(installDir); !os.IsNotExist(err) {
+		t.Fatalf("MSI install directory still exists: %v", err)
+	}
+	if _, err := os.Stat(appDir); !os.IsNotExist(err) {
+		t.Fatalf("managed metadata directory still exists: %v", err)
+	}
+	if data, err := os.ReadFile(shared); err != nil || string(data) != "keep" {
+		t.Fatalf("shared file was changed: %q, %v", data, err)
+	}
+}
+
+func TestRemoveManagedMSIAppRejectsSharedOrTraversalTarget(t *testing.T) {
+	home := t.TempDir()
+	prefix := filepath.Join(home, "programas")
+	appDir := filepath.Join(prefix, "acme")
+	if err := os.MkdirAll(appDir, 0755); err != nil {
+		t.Fatal(err)
+	}
+	for _, target := range []string{
+		filepath.Join(prefix, "drive_c", "Program Files", "Acme", "..", "Shared.exe"),
+		filepath.Join(prefix, "drive_c", "Program Files", "Shared.exe"),
+	} {
+		data, err := json.Marshal(appConfig{Name: "Acme", Target: target, Prefix: prefix, Type: "msi"})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(appDir, "config.json"), data, 0644); err != nil {
+			t.Fatal(err)
+		}
+		if err := removeManagedApp(home, prefix, "acme"); err == nil {
+			t.Fatalf("expected unsafe MSI target %q to be rejected", target)
+		}
 	}
 }
 
@@ -313,14 +428,14 @@ func TestRemoveManagedPortableAppDoesNotTouchSibling(t *testing.T) {
 	if err := removeManagedApp(home, prefix, "portable-app"); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := os.Stat(appDir); err != nil {
-		t.Fatalf("managed app directory was removed: %v", err)
+	if _, err := os.Stat(appDir); !os.IsNotExist(err) {
+		t.Fatalf("managed app directory still exists: %v", err)
 	}
 	if _, err := os.Stat(sibling); err != nil {
 		t.Fatalf("sibling was removed: %v", err)
 	}
-	if _, err := os.Stat(filepath.Join(appDir, "user-data.txt")); err != nil {
-		t.Fatalf("unowned app file was removed: %v", err)
+	if _, err := os.Stat(filepath.Join(appDir, "user-data.txt")); !os.IsNotExist(err) {
+		t.Fatalf("nested app file still exists: %v", err)
 	}
 }
 

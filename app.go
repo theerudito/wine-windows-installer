@@ -150,6 +150,13 @@ func (a *App) Uninstall(id string) OperationResult {
 		}
 		return OperationResult{Success: true, Message: "La aplicación se desinstaló correctamente."}
 	}
+	config, err := managedAppConfig(prefix, id)
+	if err != nil {
+		return OperationResult{Message: err.Error()}
+	}
+	if _, err := safeMSIInstallDirectory(prefix, config.Target); err != nil {
+		return OperationResult{Message: err.Error()}
+	}
 	process, err := a.startEnv(a.commandContext(), wineEnvironmentForPrefix(prefix), "wine", "uninstaller")
 	if err != nil {
 		return OperationResult{Message: fmt.Sprintf("No se pudo abrir el desinstalador de Wine: %v", err)}
@@ -159,7 +166,11 @@ func (a *App) Uninstall(id string) OperationResult {
 			a.emit(a.commandContext(), "installer-status", InstallerStatus{Status: "failed", Message: fmt.Sprintf("El desinstalador terminó con un error: %v.", err)})
 			return
 		}
-		a.emit(a.commandContext(), "installer-status", InstallerStatus{Status: "completed", Message: "Se cerró el desinstalador de Wine. Comprobá allí si quitaste la aplicación seleccionada; sigue en la lista porque no se pudo verificar su desinstalación."})
+		if err := removeManagedApp(home, prefix, id); err != nil {
+			a.emit(a.commandContext(), "installer-status", InstallerStatus{Status: "failed", Message: fmt.Sprintf("El desinstalador terminó, pero no se pudo completar la limpieza: %v.", err)})
+			return
+		}
+		a.emit(a.commandContext(), "installer-status", InstallerStatus{Status: "completed", Message: "La aplicación se desinstaló correctamente y se quitaron sus archivos."})
 	}()
 	return OperationResult{Success: true, Message: "Se abrió el desinstalador de Wine. Seleccioná allí la aplicación que quieras quitar."}
 }
