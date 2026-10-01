@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"fmt"
+	"os"
 	"os/exec"
 	"path/filepath"
 	"strings"
@@ -54,23 +55,19 @@ func (a *App) InstallWine() OperationResult {
 	return result
 }
 
-// Install is the only application operation: it runs the selected EXE/MSI and creates its configuration and shortcuts.
+// Install runs an MSI and records managed metadata after it completes.
 func (a *App) Install(req InstallRequest) OperationResult {
 	if err := validateInstallerPath(req.InstallerPath); err != nil {
 		return OperationResult{Message: err.Error()}
 	}
-	name := applicationName(req.InstallerPath)
+	if strings.EqualFold(filepath.Ext(req.InstallerPath), ".exe") {
+		return a.RunPortable(req.InstallerPath)
+	}
 	prefix, err := winePrefix()
 	if err != nil {
 		return OperationResult{Message: err.Error()}
 	}
 	target := req.InstallerPath
-	if strings.EqualFold(filepath.Ext(req.InstallerPath), ".exe") {
-		target, err = copyPortableExecutable(req.InstallerPath, prefix, name)
-		if err != nil {
-			return OperationResult{Message: err.Error()}
-		}
-	}
 	command, err := installerCommand(target)
 	if err != nil {
 		return OperationResult{Message: err.Error()}
@@ -83,7 +80,7 @@ func (a *App) Install(req InstallRequest) OperationResult {
 	}
 	go a.finishInstall(process, req, target, prefix, before)
 	a.emit(a.commandContext(), "installer-status", InstallerStatus{Status: "running", Message: "El archivo se está ejecutando con Wine."})
-	return OperationResult{Success: true, Message: "La operación está en ejecución. Esperá a que finalice para crear el acceso directo."}
+	return OperationResult{Success: true, Message: "La operación está en ejecución. Esperá a que finalice para registrar la instalación."}
 }
 
 func (a *App) RunPortable(path string) OperationResult {
@@ -97,8 +94,23 @@ func (a *App) RunPortable(path string) OperationResult {
 	if err != nil {
 		return OperationResult{Message: err.Error()}
 	}
-	process, err := a.startEnv(a.commandContext(), wineEnvironmentForPrefix(prefix), "wine", path)
+	home, err := userHomeDir()
 	if err != nil {
+		return OperationResult{Message: err.Error()}
+	}
+	target, err := copyPortableExecutable(path, prefix, applicationName(path))
+	if err != nil {
+		return OperationResult{Message: fmt.Sprintf("No se pudo copiar la aplicación portable: %v", err)}
+	}
+	request := InstallRequest{InstallerPath: path}
+	appDir, err := writeAppFiles(home, request, target, prefix)
+	if err != nil {
+		_ = removePortableDirectory(prefix, applicationName(path))
+		return OperationResult{Message: fmt.Sprintf("No se pudo registrar la aplicación portable: %v", err)}
+	}
+	process, err := a.startEnv(a.commandContext(), wineEnvironmentForPrefix(prefix), "wine", target)
+	if err != nil {
+		_ = removeManagedApp(home, prefix, filepath.Base(appDir))
 		return OperationResult{Message: fmt.Sprintf("No se pudo iniciar la aplicación: %v", err)}
 	}
 	go func() {
@@ -110,6 +122,14 @@ func (a *App) RunPortable(path string) OperationResult {
 	}()
 	a.emit(a.commandContext(), "installer-status", InstallerStatus{Status: "running", Message: "La aplicación se está ejecutando con Wine."})
 	return OperationResult{Success: true, Message: "La aplicación se está ejecutando."}
+}
+
+func removePortableDirectory(prefix, name string) error {
+	appDir, err := managedAppDirectory(prefix, safeAppDirectory(name))
+	if err != nil {
+		return err
+	}
+	return os.RemoveAll(appDir)
 }
 
 func (a *App) ListInstalledApps() ([]InstalledApp, error) {
@@ -154,7 +174,7 @@ func (a *App) Uninstall(id string) OperationResult {
 	if err != nil {
 		return OperationResult{Message: err.Error()}
 	}
-	if _, err := safeMSIInstallDirectory(prefix, config.Target); err != nil {
+	if _, err := safeMSIInstallDirectory(prefix, config.Target, config.InstallDir); err != nil {
 		return OperationResult{Message: err.Error()}
 	}
 	process, err := a.startEnv(a.commandContext(), wineEnvironmentForPrefix(prefix), "wine", "uninstaller")
@@ -181,24 +201,18 @@ func (a *App) finishInstall(process CommandProcess, req InstallRequest, target, 
 		return
 	}
 	message := "La aplicación finalizó correctamente."
+	installDir := ""
 	if strings.EqualFold(filepath.Ext(req.InstallerPath), ".msi") {
-		var count int
-		target, count = discoverInstalledExecutable(prefix, before)
-		if count != 1 {
-			a.emit(a.commandContext(), "installer-status", InstallerStatus{Status: "completed", Message: "La instalación terminó, pero no se pudo crear automáticamente el acceso directo porque no se encontró un único ejecutable instalado."})
-			return
-		}
+		target, _, installDir = discoverInstalledLocation(prefix, before)
 		message = "La instalación terminó correctamente."
 	}
 	home, err := userHomeDir()
 	if err != nil {
-		a.emit(a.commandContext(), "installer-status", InstallerStatus{Status: "completed", Message: message + " No se pudo crear automáticamente el acceso directo."})
+		a.emit(a.commandContext(), "installer-status", InstallerStatus{Status: "completed", Message: message + " No se pudo registrar la instalación."})
 		return
 	}
-	if _, err := writeAppFiles(home, req, target, prefix); err != nil {
-		message += " No se pudo crear automáticamente el acceso directo."
-	} else {
-		message += " Se creó el acceso directo."
+	if _, err := writeAppFiles(home, req, target, prefix, installDir); err != nil {
+		message += " No se pudo registrar la instalación."
 	}
 	a.emit(a.commandContext(), "installer-status", InstallerStatus{Status: "completed", Message: message})
 }

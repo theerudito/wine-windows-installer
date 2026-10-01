@@ -7,6 +7,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestInstallerCommand(t *testing.T) {
@@ -33,14 +34,47 @@ func TestInstallerCommand(t *testing.T) {
 	}
 }
 
+func TestWinePrefixMigratesLegacyDirectory(t *testing.T) {
+	home := t.TempDir()
+	legacy := filepath.Join(home, "programas")
+	marker := filepath.Join(legacy, "marker")
+	if err := os.MkdirAll(legacy, 0755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(marker, []byte("legacy"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	prefix, err := winePrefixForHome(home)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := filepath.Join(home, "Programs Wine")
+	if prefix != want {
+		t.Fatalf("prefix = %q, want %q", prefix, want)
+	}
+	if _, err := os.Stat(filepath.Join(prefix, "marker")); err != nil {
+		t.Fatalf("legacy prefix was not migrated: %v", err)
+	}
+	if _, err := os.Stat(legacy); !os.IsNotExist(err) {
+		t.Fatalf("legacy prefix still exists: %v", err)
+	}
+}
+
 func TestCopyPortableExecutableUsesApplicationDirectoryAndSafeTarget(t *testing.T) {
 	home := t.TempDir()
-	prefix := filepath.Join(home, "programas")
-	source := filepath.Join(home, "Downloads", "portable.exe")
-	if err := os.MkdirAll(filepath.Dir(source), 0755); err != nil {
+	prefix := filepath.Join(home, "Programs Wine")
+	sourceDir := filepath.Join(home, "Downloads", "Portable App")
+	source := filepath.Join(sourceDir, "portable.exe")
+	if err := os.MkdirAll(filepath.Join(sourceDir, "assets", "nested"), 0755); err != nil {
 		t.Fatal(err)
 	}
 	if err := os.WriteFile(source, []byte("portable"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(sourceDir, "assets", "data.bin"), []byte("asset"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(sourceDir, "assets", "nested", "config.ini"), []byte("config"), 0600); err != nil {
 		t.Fatal(err)
 	}
 	target, err := copyPortableExecutable(source, prefix, "../Mi App")
@@ -55,12 +89,40 @@ func TestCopyPortableExecutableUsesApplicationDirectoryAndSafeTarget(t *testing.
 	if err != nil || string(data) != "portable" {
 		t.Fatalf("copied executable = %q, err = %v", data, err)
 	}
+	for relative, want := range map[string]string{"assets/data.bin": "asset", "assets/nested/config.ini": "config"} {
+		data, err := os.ReadFile(filepath.Join(prefix, "mi-app", relative))
+		if err != nil || string(data) != want {
+			t.Fatalf("copied companion file %q = %q, err = %v", relative, data, err)
+		}
+	}
 	if original, err := os.ReadFile(source); err != nil || string(original) != "portable" {
 		t.Fatalf("source executable changed: %q, err = %v", original, err)
 	}
-	entry := desktopEntryContent("Mi App", target, prefix)
-	if !strings.Contains(entry, "wine "+desktopExecArg(target)) {
-		t.Fatalf("desktop target = %s", entry)
+}
+
+func TestCopyPortableExecutableRejectsSymlinkInSourceFolder(t *testing.T) {
+	home := t.TempDir()
+	sourceDir := filepath.Join(home, "Downloads", "Portable App")
+	prefix := filepath.Join(home, "Programs Wine")
+	if err := os.MkdirAll(sourceDir, 0755); err != nil {
+		t.Fatal(err)
+	}
+	source := filepath.Join(sourceDir, "portable.exe")
+	if err := os.WriteFile(source, []byte("portable"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	outside := filepath.Join(home, "outside.dat")
+	if err := os.WriteFile(outside, []byte("outside"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(outside, filepath.Join(sourceDir, "linked.dat")); err != nil {
+		t.Skipf("symlink creation unavailable: %v", err)
+	}
+	if _, err := copyPortableExecutable(source, prefix, "Portable App"); err == nil {
+		t.Fatal("expected symlinked companion file to be rejected")
+	}
+	if _, err := os.Stat(filepath.Join(prefix, "portable-app")); !os.IsNotExist(err) {
+		t.Fatalf("partial portable directory remains: %v", err)
 	}
 }
 
@@ -97,9 +159,33 @@ func TestDiscoverInstalledExecutableRejectsAmbiguousResults(t *testing.T) {
 	}
 }
 
-func TestWriteAppFilesPersistsIconAndDesktop(t *testing.T) {
+func TestManagedMSIConfigUsesValidatedInstallDirectoryWhenTargetIsAmbiguous(t *testing.T) {
 	home := t.TempDir()
-	prefix := filepath.Join(home, "programas")
+	prefix := filepath.Join(home, "Programs Wine")
+	installDir := filepath.Join(prefix, "drive_c", "Program Files", "Acme")
+	appDir := filepath.Join(prefix, "acme")
+	if err := os.MkdirAll(appDir, 0755); err != nil {
+		t.Fatal(err)
+	}
+	data, err := json.Marshal(appConfig{Name: "Acme", Prefix: prefix, Type: "msi", InstallDir: installDir})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(appDir, "config.json"), data, 0644); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := safeMSIInstallDirectory(prefix, "", installDir); err != nil {
+		t.Fatalf("ambiguous MSI install directory rejected: %v", err)
+	}
+	apps, err := listInstalledApps(prefix)
+	if err != nil || len(apps) != 1 || apps[0].ID != "acme" || apps[0].Type != "msi" {
+		t.Fatalf("apps = %#v, err = %v", apps, err)
+	}
+}
+
+func TestWriteAppFilesPersistsManagedConfigWithMenuLauncherOnly(t *testing.T) {
+	home := t.TempDir()
+	prefix := filepath.Join(home, "Programs Wine")
 	target := filepath.Join(prefix, "drive_c", "Program Files", "App", "app.exe")
 	if err := os.MkdirAll(filepath.Dir(target), 0755); err != nil {
 		t.Fatal(err)
@@ -111,30 +197,20 @@ func TestWriteAppFilesPersistsIconAndDesktop(t *testing.T) {
 	if err := os.WriteFile(req.InstallerPath, nil, 0600); err != nil {
 		t.Fatal(err)
 	}
-	shortcut, err := writeAppFiles(home, req, target, prefix)
+	_, err := writeAppFiles(home, req, target, prefix)
 	if err != nil {
 		t.Fatal(err)
-	}
-	content, err := os.ReadFile(shortcut)
-	if err != nil {
-		t.Fatal(err)
-	}
-	text := string(content)
-	if !strings.Contains(text, "Icon=application-x-executable") {
-		t.Fatalf("desktop entry = %s", text)
 	}
 	if _, err := os.Stat(filepath.Join(prefix, "mi-app", "config.json")); err != nil {
 		t.Fatal(err)
 	}
-	desktop, err := desktopDirectory(home)
-	if err != nil {
-		t.Fatal(err)
+	if _, err := os.Stat(filepath.Join(home, "Desktop", "mi-app.desktop")); !os.IsNotExist(err) {
+		t.Fatalf("unexpected desktop shortcut: %v", err)
 	}
-	if _, err := os.Stat(filepath.Join(desktop, "mi-app.desktop")); err != nil {
-		t.Fatalf("Desktop shortcut = %v", err)
-	}
-	if !strings.Contains(text, "StartupNotify=true") {
-		t.Fatalf("desktop entry missing startup notification: %s", text)
+	launcher := filepath.Join(home, ".local", "share", "applications", "mi-app.desktop")
+	launcherData, err := os.ReadFile(launcher)
+	if err != nil || !strings.Contains(string(launcherData), "Exec=env "+desktopExecArg("WINEPREFIX="+filepath.Dir(filepath.Dir(target)))+" wine "+desktopExecArg(target)) || !strings.Contains(string(launcherData), "Path="+desktopExecArg(filepath.Dir(target))) {
+		t.Fatalf("menu launcher = %s, err = %v", launcherData, err)
 	}
 	config, err := os.ReadFile(filepath.Join(prefix, "mi-app", "config.json"))
 	if err != nil || !strings.Contains(string(config), filepath.Base(target)) || !strings.Contains(string(config), filepath.Base(prefix)) {
@@ -142,23 +218,18 @@ func TestWriteAppFilesPersistsIconAndDesktop(t *testing.T) {
 	}
 }
 
-func TestWriteAppFilesUsesFallbackIconAndDesktop(t *testing.T) {
+func TestWriteAppFilesDoesNotCreateLauncherForMSI(t *testing.T) {
 	home := t.TempDir()
-	prefix := filepath.Join(home, "programas")
-	req := InstallRequest{InstallerPath: filepath.Join(home, "Fallback App.exe")}
-	shortcut, err := writeAppFiles(home, req, filepath.Join(prefix, "drive_c", "app.exe"), prefix)
+	prefix := filepath.Join(home, "Programs Wine")
+	req := InstallRequest{InstallerPath: filepath.Join(home, "Fallback App.msi")}
+	_, err := writeAppFiles(home, req, filepath.Join(prefix, "drive_c", "app.exe"), prefix)
 	if err != nil {
 		t.Fatal(err)
 	}
-	content, err := os.ReadFile(shortcut)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if !strings.Contains(string(content), "Icon=application-x-executable") {
-		t.Fatalf("desktop entry = %s", content)
-	}
-	if _, err := os.Stat(filepath.Join(home, "Desktop", "fallback-app.desktop")); err != nil {
-		t.Fatalf("Desktop shortcut = %v", err)
+	for _, shortcut := range []string{filepath.Join(home, "Desktop", "fallback-app.desktop"), filepath.Join(home, ".local", "share", "applications", "fallback-app.desktop")} {
+		if _, err := os.Stat(shortcut); !os.IsNotExist(err) {
+			t.Fatalf("unexpected shortcut %q: %v", shortcut, err)
+		}
 	}
 }
 
@@ -185,9 +256,17 @@ func TestInstallUsesWinePrefixAndMSIArguments(t *testing.T) {
 	if !result.Success {
 		t.Fatalf("result = %#v", result)
 	}
-	if gotName != "wine" || strings.Join(gotArgs, "\x00") != strings.Join([]string{"msiexec", "/i", path}, "\x00") || gotEnv[0] != "WINEPREFIX="+filepath.Join(home, "programas") {
+	if gotName != "wine" || strings.Join(gotArgs, "\x00") != strings.Join([]string{"msiexec", "/i", path}, "\x00") || gotEnv[0] != "WINEPREFIX="+filepath.Join(home, "Programs Wine") {
 		t.Fatalf("command=%s %#v env=%#v", gotName, gotArgs, gotEnv)
 	}
+	configPath := filepath.Join(home, "Programs Wine", "setup", "config.json")
+	for range 100 {
+		if _, err := os.Stat(configPath); err == nil {
+			return
+		}
+		time.Sleep(time.Millisecond)
+	}
+	t.Fatal("MSI metadata was not written")
 }
 
 func TestRunPortableUsesWinePrefixAndSelectedExecutable(t *testing.T) {
@@ -195,7 +274,10 @@ func TestRunPortableUsesWinePrefixAndSelectedExecutable(t *testing.T) {
 	old := userHomeDir
 	userHomeDir = func() (string, error) { return home, nil }
 	t.Cleanup(func() { userHomeDir = old })
-	path := filepath.Join(home, "portable.exe")
+	path := filepath.Join(home, "Downloads", "Portable App", "portable.exe")
+	if err := os.MkdirAll(filepath.Dir(path), 0755); err != nil {
+		t.Fatal(err)
+	}
 	if err := os.WriteFile(path, nil, 0600); err != nil {
 		t.Fatal(err)
 	}
@@ -209,8 +291,12 @@ func TestRunPortableUsesWinePrefixAndSelectedExecutable(t *testing.T) {
 	if !result.Success {
 		t.Fatalf("result = %#v", result)
 	}
-	if gotName != "wine" || strings.Join(gotArgs, "\x00") != path || strings.Join(gotEnv, "\x00") != "WINEPREFIX="+filepath.Join(home, "programas") {
+	wantTarget := filepath.Join(home, "Programs Wine", "portable", "portable.exe")
+	if gotName != "wine" || strings.Join(gotArgs, "\x00") != wantTarget || strings.Join(gotEnv, "\x00") != "WINEPREFIX="+filepath.Join(home, "Programs Wine") {
 		t.Fatalf("command=%s %#v env=%#v", gotName, gotArgs, gotEnv)
+	}
+	if _, err := os.Stat(filepath.Join(home, ".local", "share", "applications", "portable.desktop")); err != nil {
+		t.Fatalf("portable launcher was not created: %v", err)
 	}
 }
 
@@ -225,7 +311,7 @@ func TestUninstallMSIUsesWinePrefixAndOfficialCommand(t *testing.T) {
 	old := userHomeDir
 	userHomeDir = func() (string, error) { return home, nil }
 	t.Cleanup(func() { userHomeDir = old })
-	prefix := filepath.Join(home, "programas")
+	prefix := filepath.Join(home, "Programs Wine")
 	appDir := filepath.Join(prefix, "acme")
 	installDir := filepath.Join(prefix, "drive_c", "Program Files", "Acme")
 	if err := os.MkdirAll(installDir, 0755); err != nil {
@@ -255,14 +341,14 @@ func TestUninstallMSIUsesWinePrefixAndOfficialCommand(t *testing.T) {
 	if !result.Success {
 		t.Fatalf("result = %#v", result)
 	}
-	if gotName != "wine" || strings.Join(gotArgs, "\x00") != "uninstaller" || strings.Join(gotEnv, "\x00") != "WINEPREFIX="+filepath.Join(home, "programas") {
+	if gotName != "wine" || strings.Join(gotArgs, "\x00") != "uninstaller" || strings.Join(gotEnv, "\x00") != "WINEPREFIX="+filepath.Join(home, "Programs Wine") {
 		t.Fatalf("command=%s %#v env=%#v", gotName, gotArgs, gotEnv)
 	}
 }
 
 func TestRemoveManagedPortableAppRemovesEntireDirectoryAndPreservesSiblings(t *testing.T) {
 	home := t.TempDir()
-	prefix := filepath.Join(home, "programas")
+	prefix := filepath.Join(home, "Programs Wine")
 	appDir := filepath.Join(prefix, "portable-app")
 	sibling := filepath.Join(prefix, "sibling", "keep.txt")
 	if err := os.MkdirAll(filepath.Join(appDir, "nested", "deeper"), 0755); err != nil {
@@ -299,7 +385,7 @@ func TestRemoveManagedPortableAppRemovesEntireDirectoryAndPreservesSiblings(t *t
 
 func TestRemoveManagedMSIAppRemovesInstallDirectoryAndPreservesSharedFiles(t *testing.T) {
 	home := t.TempDir()
-	prefix := filepath.Join(home, "programas")
+	prefix := filepath.Join(home, "Programs Wine")
 	appDir := filepath.Join(prefix, "acme")
 	installDir := filepath.Join(prefix, "drive_c", "Program Files", "Acme")
 	shared := filepath.Join(prefix, "drive_c", "Program Files", "Shared", "keep.dll")
@@ -345,7 +431,7 @@ func TestRemoveManagedMSIAppRemovesInstallDirectoryAndPreservesSharedFiles(t *te
 
 func TestRemoveManagedMSIAppRejectsSharedOrTraversalTarget(t *testing.T) {
 	home := t.TempDir()
-	prefix := filepath.Join(home, "programas")
+	prefix := filepath.Join(home, "Programs Wine")
 	appDir := filepath.Join(prefix, "acme")
 	if err := os.MkdirAll(appDir, 0755); err != nil {
 		t.Fatal(err)
@@ -368,7 +454,7 @@ func TestRemoveManagedMSIAppRejectsSharedOrTraversalTarget(t *testing.T) {
 }
 
 func TestListInstalledAppsReadsManagedConfigsOnly(t *testing.T) {
-	prefix := filepath.Join(t.TempDir(), "programas")
+	prefix := filepath.Join(t.TempDir(), "Programs Wine")
 	if err := os.MkdirAll(filepath.Join(prefix, "portable-app"), 0755); err != nil {
 		t.Fatal(err)
 	}
@@ -400,7 +486,7 @@ func TestListInstalledAppsReturnsEmptyForMissingPrefix(t *testing.T) {
 
 func TestRemoveManagedPortableAppDoesNotTouchSibling(t *testing.T) {
 	home := t.TempDir()
-	prefix := filepath.Join(home, "programas")
+	prefix := filepath.Join(home, "Programs Wine")
 	appDir := filepath.Join(prefix, "portable-app")
 	sibling := filepath.Join(prefix, "sibling", "keep.txt")
 	if err := os.MkdirAll(filepath.Dir(sibling), 0755); err != nil {
@@ -425,6 +511,14 @@ func TestRemoveManagedPortableAppDoesNotTouchSibling(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(appDir, "user-data.txt"), []byte("keep"), 0644); err != nil {
 		t.Fatal(err)
 	}
+	launcher := filepath.Join(home, ".local", "share", "applications", "portable-app.desktop")
+	if err := os.MkdirAll(filepath.Dir(launcher), 0755); err != nil {
+		t.Fatal(err)
+	}
+	launcherData := "[Desktop Entry]\nExec=env " + desktopExecArg("WINEPREFIX="+filepath.Dir(filepath.Dir(filepath.Join(appDir, "app.exe")))) + " wine " + desktopExecArg(filepath.Join(appDir, "app.exe")) + "\nX-WindowsInstaller-Managed=true\n"
+	if err := os.WriteFile(launcher, []byte(launcherData), 0644); err != nil {
+		t.Fatal(err)
+	}
 	if err := removeManagedApp(home, prefix, "portable-app"); err != nil {
 		t.Fatal(err)
 	}
@@ -437,11 +531,47 @@ func TestRemoveManagedPortableAppDoesNotTouchSibling(t *testing.T) {
 	if _, err := os.Stat(filepath.Join(appDir, "user-data.txt")); !os.IsNotExist(err) {
 		t.Fatalf("nested app file still exists: %v", err)
 	}
+	if _, err := os.Stat(launcher); !os.IsNotExist(err) {
+		t.Fatalf("owned menu launcher still exists: %v", err)
+	}
+}
+
+func TestRemoveManagedPortableAppPreservesUnownedMenuLauncher(t *testing.T) {
+	home := t.TempDir()
+	prefix := filepath.Join(home, "Programs Wine")
+	appDir := filepath.Join(prefix, "portable-app")
+	if err := os.MkdirAll(appDir, 0755); err != nil {
+		t.Fatal(err)
+	}
+	target := filepath.Join(appDir, "app.exe")
+	if err := os.WriteFile(target, nil, 0755); err != nil {
+		t.Fatal(err)
+	}
+	data, err := json.Marshal(appConfig{Name: "Portable App", Target: target, Prefix: prefix, Type: "portable"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(appDir, "config.json"), data, 0644); err != nil {
+		t.Fatal(err)
+	}
+	launcher := filepath.Join(home, ".local", "share", "applications", "portable-app.desktop")
+	if err := os.MkdirAll(filepath.Dir(launcher), 0755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(launcher, []byte("[Desktop Entry]\nName=Other App\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	if err := removeManagedApp(home, prefix, "portable-app"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(launcher); err != nil {
+		t.Fatalf("unowned launcher was removed: %v", err)
+	}
 }
 
 func TestRemoveManagedAppRejectsConfigNameThatTargetsAnotherShortcut(t *testing.T) {
 	home := t.TempDir()
-	prefix := filepath.Join(home, "programas")
+	prefix := filepath.Join(home, "Programs Wine")
 	appDir := filepath.Join(prefix, "portable-app")
 	if err := os.MkdirAll(appDir, 0755); err != nil {
 		t.Fatal(err)
@@ -460,7 +590,7 @@ func TestRemoveManagedAppRejectsConfigNameThatTargetsAnotherShortcut(t *testing.
 
 func TestRemoveManagedAppRejectsSymlinkedManagedConfig(t *testing.T) {
 	home := t.TempDir()
-	prefix := filepath.Join(home, "programas")
+	prefix := filepath.Join(home, "Programs Wine")
 	appDir := filepath.Join(prefix, "portable-app")
 	outside := filepath.Join(home, "outside-config.json")
 	if err := os.MkdirAll(appDir, 0755); err != nil {
