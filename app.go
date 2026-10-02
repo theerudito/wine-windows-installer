@@ -74,7 +74,7 @@ func (a *App) Install(req InstallRequest) OperationResult {
 	}
 	env := wineEnvironmentForPrefix(prefix)
 	before := snapshotExecutables(prefix)
-	process, err := a.startEnv(a.commandContext(), env, command[0], command[1:]...)
+	process, err := a.startEnv(a.commandContext(), env, filepath.Dir(target), command[0], command[1:]...)
 	if err != nil {
 		return OperationResult{Message: fmt.Sprintf("No se pudo iniciar el archivo: %v", err)}
 	}
@@ -108,14 +108,15 @@ func (a *App) RunPortable(path string) OperationResult {
 		_ = removePortableDirectory(prefix, applicationName(path))
 		return OperationResult{Message: fmt.Sprintf("No se pudo registrar la aplicación portable: %v", err)}
 	}
-	process, err := a.startEnv(a.commandContext(), wineEnvironmentForPrefix(prefix), "wine", target)
+	workingDir := filepath.Dir(target)
+	process, err := a.startEnv(a.commandContext(), wineEnvironmentForPrefix(prefix), workingDir, "wine", target)
 	if err != nil {
 		_ = removeManagedApp(home, prefix, filepath.Base(appDir))
 		return OperationResult{Message: fmt.Sprintf("No se pudo iniciar la aplicación: %v", err)}
 	}
 	go func() {
 		if err := process.Wait(); err != nil {
-			a.emit(a.commandContext(), "installer-status", InstallerStatus{Status: "failed", Message: fmt.Sprintf("La aplicación terminó con un error: %v.", err)})
+			a.emit(a.commandContext(), "installer-status", InstallerStatus{Status: "failed", Message: processFailureMessage("La aplicación terminó con un error", process, err)})
 			return
 		}
 		a.emit(a.commandContext(), "installer-status", InstallerStatus{Status: "completed", Message: "La aplicación finalizó correctamente."})
@@ -177,13 +178,13 @@ func (a *App) Uninstall(id string) OperationResult {
 	if _, err := safeMSIInstallDirectory(prefix, config.Target, config.InstallDir); err != nil {
 		return OperationResult{Message: err.Error()}
 	}
-	process, err := a.startEnv(a.commandContext(), wineEnvironmentForPrefix(prefix), "wine", "uninstaller")
+	process, err := a.startEnv(a.commandContext(), wineEnvironmentForPrefix(prefix), filepath.Dir(config.Target), "wine", "uninstaller")
 	if err != nil {
 		return OperationResult{Message: fmt.Sprintf("No se pudo abrir el desinstalador de Wine: %v", err)}
 	}
 	go func() {
 		if err := process.Wait(); err != nil {
-			a.emit(a.commandContext(), "installer-status", InstallerStatus{Status: "failed", Message: fmt.Sprintf("El desinstalador terminó con un error: %v.", err)})
+			a.emit(a.commandContext(), "installer-status", InstallerStatus{Status: "failed", Message: processFailureMessage("El desinstalador terminó con un error", process, err)})
 			return
 		}
 		if err := removeManagedApp(home, prefix, id); err != nil {
@@ -197,7 +198,7 @@ func (a *App) Uninstall(id string) OperationResult {
 
 func (a *App) finishInstall(process CommandProcess, req InstallRequest, target, prefix string, before map[string]struct{}) {
 	if err := process.Wait(); err != nil {
-		a.emit(a.commandContext(), "installer-status", InstallerStatus{Status: "failed", Message: fmt.Sprintf("La operación terminó con un error: %v.", err)})
+		a.emit(a.commandContext(), "installer-status", InstallerStatus{Status: "failed", Message: processFailureMessage("La operación terminó con un error", process, err)})
 		return
 	}
 	message := "La aplicación finalizó correctamente."

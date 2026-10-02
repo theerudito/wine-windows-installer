@@ -3,8 +3,10 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
@@ -211,7 +213,7 @@ func TestWriteAppFilesPersistsManagedConfigWithMenuLauncherOnly(t *testing.T) {
 	}
 	launcher := filepath.Join(home, ".local", "share", "applications", "mi-app.desktop")
 	launcherData, err := os.ReadFile(launcher)
-	if err != nil || !strings.Contains(string(launcherData), "Exec=env "+desktopExecArg("WINEPREFIX="+filepath.Dir(filepath.Dir(target)))+" wine "+desktopExecArg(target)) || !strings.Contains(string(launcherData), "Path="+desktopExecArg(filepath.Dir(target))) {
+	if err != nil || !strings.Contains(string(launcherData), "Exec=env "+desktopExecArg("WINEPREFIX="+filepath.Dir(filepath.Dir(target)))+" wine "+desktopExecArg(target)) || !strings.Contains(string(launcherData), "Path="+filepath.Dir(target)) {
 		t.Fatalf("menu launcher = %s, err = %v", launcherData, err)
 	}
 	config, err := os.ReadFile(filepath.Join(prefix, "mi-app", "config.json"))
@@ -237,11 +239,16 @@ func TestWriteAppFilesDoesNotCreateLauncherForMSI(t *testing.T) {
 
 type fakeProcess struct{}
 
-func (fakeProcess) Wait() error { return nil }
+func (fakeProcess) Wait() error    { return nil }
+func (fakeProcess) Output() string { return "" }
 
-type callbackProcess func() error
+type callbackProcess struct {
+	wait   func() error
+	output string
+}
 
-func (process callbackProcess) Wait() error { return process() }
+func (process callbackProcess) Wait() error    { return process.wait() }
+func (process callbackProcess) Output() string { return process.output }
 
 func awaitInstallerStatus(t *testing.T, statuses <-chan InstallerStatus, want string) InstallerStatus {
 	t.Helper()
@@ -271,7 +278,7 @@ func TestInstallUsesWinePrefixAndMSIArguments(t *testing.T) {
 	var gotName string
 	var gotArgs, gotEnv []string
 	statuses := make(chan InstallerStatus, 2)
-	app := &App{startEnv: func(_ context.Context, env []string, name string, args ...string) (CommandProcess, error) {
+	app := &App{startEnv: func(_ context.Context, env []string, _ string, name string, args ...string) (CommandProcess, error) {
 		gotEnv, gotName, gotArgs = env, name, args
 		return fakeProcess{}, nil
 	}, emit: func(_ context.Context, _ string, values ...interface{}) {
@@ -309,14 +316,14 @@ func TestInstallPersistsMSIMetadataWhenExecutableIsDiscovered(t *testing.T) {
 	target := filepath.Join(prefix, "drive_c", "Program Files", "Acme", "Acme.exe")
 	statuses := make(chan InstallerStatus, 2)
 	app := &App{
-		startEnv: func(context.Context, []string, string, ...string) (CommandProcess, error) {
+		startEnv: func(context.Context, []string, string, string, ...string) (CommandProcess, error) {
 			if err := os.MkdirAll(filepath.Dir(target), 0755); err != nil {
 				return nil, err
 			}
 			if err := os.WriteFile(target, nil, 0600); err != nil {
 				return nil, err
 			}
-			return callbackProcess(func() error { return nil }), nil
+			return callbackProcess{wait: func() error { return nil }}, nil
 		},
 		emit: func(_ context.Context, _ string, values ...interface{}) {
 			if len(values) == 1 {
@@ -361,8 +368,11 @@ func TestRunPortableUsesWinePrefixAndSelectedExecutable(t *testing.T) {
 	}
 	var gotName string
 	var gotArgs, gotEnv []string
-	app := &App{startEnv: func(_ context.Context, env []string, name string, args ...string) (CommandProcess, error) {
+	app := &App{startEnv: func(_ context.Context, env []string, workingDir, name string, args ...string) (CommandProcess, error) {
 		gotEnv, gotName, gotArgs = env, name, args
+		if workingDir != filepath.Join(home, "Programs Wine", "portable") {
+			t.Fatalf("working directory = %q", workingDir)
+		}
 		return fakeProcess{}, nil
 	}, emit: func(context.Context, string, ...interface{}) {}}
 	result := app.RunPortable(path)
@@ -375,6 +385,72 @@ func TestRunPortableUsesWinePrefixAndSelectedExecutable(t *testing.T) {
 	}
 	if _, err := os.Stat(filepath.Join(home, ".local", "share", "applications", "portable.desktop")); err != nil {
 		t.Fatalf("portable launcher was not created: %v", err)
+	}
+}
+
+func TestRunPortableReportsExitStatusAndBoundedWineOutput(t *testing.T) {
+	home := t.TempDir()
+	old := userHomeDir
+	userHomeDir = func() (string, error) { return home, nil }
+	t.Cleanup(func() { userHomeDir = old })
+	path := filepath.Join(home, "Downloads", "portable.exe")
+	if err := os.MkdirAll(filepath.Dir(path), 0755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, nil, 0600); err != nil {
+		t.Fatal(err)
+	}
+	status := make(chan InstallerStatus, 3)
+	app := &App{
+		startEnv: func(context.Context, []string, string, string, ...string) (CommandProcess, error) {
+			return callbackProcess{wait: func() error { return errors.New("exit status 7") }, output: "password=do-not-show\nWine failed"}, nil
+		},
+		emit: func(_ context.Context, _ string, values ...interface{}) { status <- values[0].(InstallerStatus) },
+	}
+	if result := app.RunPortable(path); !result.Success {
+		t.Fatalf("result = %#v", result)
+	}
+	failed := awaitInstallerStatus(t, status, "failed")
+	if !strings.Contains(failed.Message, "exit status 7") || !strings.Contains(failed.Message, "Wine failed") {
+		t.Fatalf("failed status = %#v", failed)
+	}
+	if strings.Contains(failed.Message, "do-not-show") {
+		t.Fatalf("secret leaked in failed status: %q", failed.Message)
+	}
+}
+
+func TestBoundedOutputTruncatesProcessOutput(t *testing.T) {
+	output := &boundedOutput{}
+	input := strings.Repeat("x", maxWineOutput+100)
+	if _, err := output.Write([]byte(input)); err != nil {
+		t.Fatal(err)
+	}
+	if got := output.String(); len(got) > maxWineOutput+len("\n[Wine output truncated]") {
+		t.Fatalf("output length = %d, want bounded output", len(got))
+	}
+	if !strings.HasSuffix(output.String(), "[Wine output truncated]") {
+		t.Fatalf("output was not marked truncated")
+	}
+}
+
+func TestDefaultCommandStarterCapturesBothStreamsAndExitStatus(t *testing.T) {
+	if runtime.GOOS != "linux" {
+		t.Skip("requires a POSIX shell")
+	}
+	if testing.Short() {
+		t.Skip("external command test")
+	}
+	workingDir := t.TempDir()
+	process, err := defaultCommandStarterWithEnv(context.Background(), nil, workingDir, "sh", "-c", "printf stdout; printf stderr >&2; exit 7")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := process.Wait(); err == nil {
+		t.Fatal("expected non-zero exit status")
+	}
+	output := process.Output()
+	if !strings.Contains(output, "stdout") || !strings.Contains(output, "stderr") {
+		t.Fatalf("captured output = %q", output)
 	}
 }
 
@@ -411,7 +487,7 @@ func TestUninstallMSIUsesWinePrefixAndOfficialCommand(t *testing.T) {
 	}
 	var gotName string
 	var gotArgs, gotEnv []string
-	app := &App{startEnv: func(_ context.Context, env []string, name string, args ...string) (CommandProcess, error) {
+	app := &App{startEnv: func(_ context.Context, env []string, _ string, name string, args ...string) (CommandProcess, error) {
 		gotEnv, gotName, gotArgs = env, name, args
 		return fakeProcess{}, nil
 	}, emit: func(context.Context, string, ...interface{}) {}}

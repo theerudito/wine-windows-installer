@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -11,6 +12,7 @@ import (
 	"runtime"
 	"sort"
 	"strings"
+	"sync"
 	"unicode"
 )
 
@@ -20,8 +22,11 @@ var (
 )
 
 type CommandRunner func(ctx context.Context, name string, args ...string) ([]byte, error)
-type CommandProcess interface{ Wait() error }
-type CommandStarterWithEnv func(ctx context.Context, env []string, name string, args ...string) (CommandProcess, error)
+type CommandProcess interface {
+	Wait() error
+	Output() string
+}
+type CommandStarterWithEnv func(ctx context.Context, env []string, workingDir, name string, args ...string) (CommandProcess, error)
 
 type WineStatus struct {
 	Installed bool   `json:"installed"`
@@ -289,7 +294,9 @@ func writePortableLauncher(home, name, target, workingDir string) error {
 	if err := os.MkdirAll(filepath.Dir(path), 0755); err != nil {
 		return fmt.Errorf("no se pudo preparar el menú de aplicaciones: %w", err)
 	}
-	content := "[Desktop Entry]\nType=Application\nName=" + name + "\nExec=env " + desktopExecArg("WINEPREFIX="+filepath.Dir(filepath.Dir(target))) + " wine " + desktopExecArg(target) + "\nPath=" + desktopExecArg(workingDir) + "\nIcon=application-x-executable\nTerminal=false\nX-WindowsInstaller-Managed=true\n"
+	// Path is a Desktop Entry key, not a shell argument: quoting it makes the
+	// quotes part of the directory name for some desktop environments.
+	content := "[Desktop Entry]\nType=Application\nName=" + name + "\nExec=env " + desktopExecArg("WINEPREFIX="+filepath.Dir(filepath.Dir(target))) + " wine " + desktopExecArg(target) + "\nPath=" + workingDir + "\nIcon=application-x-executable\nTerminal=false\nX-WindowsInstaller-Managed=true\n"
 	if err := os.WriteFile(path, []byte(content), 0644); err != nil {
 		return fmt.Errorf("no se pudo crear el acceso del menú de aplicaciones: %w", err)
 	}
@@ -576,13 +583,80 @@ func snapshotExecutables(prefix string) map[string]struct{} {
 func defaultCommandRunner(ctx context.Context, name string, args ...string) ([]byte, error) {
 	return exec.CommandContext(ctx, name, args...).CombinedOutput()
 }
-func defaultCommandStarterWithEnv(ctx context.Context, env []string, name string, args ...string) (CommandProcess, error) {
+
+const maxWineOutput = 4096
+
+type boundedOutput struct {
+	mu        sync.Mutex
+	data      bytes.Buffer
+	truncated bool
+}
+
+func (w *boundedOutput) Write(p []byte) (int, error) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	remaining := maxWineOutput - w.data.Len()
+	if remaining <= 0 {
+		w.truncated = true
+		return len(p), nil
+	}
+	if len(p) > remaining {
+		_, _ = w.data.Write(p[:remaining])
+		w.truncated = true
+		return len(p), nil
+	}
+	_, _ = w.data.Write(p)
+	return len(p), nil
+}
+
+func (w *boundedOutput) String() string {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	output := w.data.String()
+	if w.truncated {
+		output += "\n[Wine output truncated]"
+	}
+	return output
+}
+
+type commandProcess struct {
+	cmd    *exec.Cmd
+	output *boundedOutput
+}
+
+func (p *commandProcess) Wait() error    { return p.cmd.Wait() }
+func (p *commandProcess) Output() string { return p.output.String() }
+
+func sanitizeWineOutput(output string) string {
+	lines := strings.Split(output, "\n")
+	for i, line := range lines {
+		lower := strings.ToLower(line)
+		if strings.Contains(lower, "password") || strings.Contains(lower, "secret") || strings.Contains(lower, "token") || strings.Contains(lower, "api_key") {
+			lines[i] = "[Wine output redacted]"
+		}
+	}
+	return strings.TrimSpace(strings.Join(lines, "\n"))
+}
+
+func processFailureMessage(prefix string, process CommandProcess, err error) string {
+	message := fmt.Sprintf("%s: %v.", prefix, err)
+	if output := sanitizeWineOutput(process.Output()); output != "" {
+		message += " Salida de Wine: " + output
+	}
+	return message
+}
+
+func defaultCommandStarterWithEnv(ctx context.Context, env []string, workingDir, name string, args ...string) (CommandProcess, error) {
 	command := exec.CommandContext(ctx, name, args...)
 	command.Env = append(os.Environ(), env...)
+	command.Dir = workingDir
+	output := &boundedOutput{}
+	command.Stdout = output
+	command.Stderr = output
 	if err := command.Start(); err != nil {
 		return nil, err
 	}
-	return command, nil
+	return &commandProcess{cmd: command, output: output}, nil
 }
 func detectWine(ctx context.Context, run CommandRunner) WineStatus {
 	if runtime.GOOS != "linux" {
