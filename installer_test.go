@@ -89,10 +89,9 @@ func TestCopyPortableExecutableUsesApplicationDirectoryAndSafeTarget(t *testing.
 	if err != nil || string(data) != "portable" {
 		t.Fatalf("copied executable = %q, err = %v", data, err)
 	}
-	for relative, want := range map[string]string{"assets/data.bin": "asset", "assets/nested/config.ini": "config"} {
-		data, err := os.ReadFile(filepath.Join(prefix, "mi-app", relative))
-		if err != nil || string(data) != want {
-			t.Fatalf("copied companion file %q = %q, err = %v", relative, data, err)
+	for _, relative := range []string{"assets/data.bin", "assets/nested/config.ini"} {
+		if _, err := os.Stat(filepath.Join(prefix, "mi-app", relative)); !os.IsNotExist(err) {
+			t.Fatalf("unexpected companion file %q: %v", relative, err)
 		}
 	}
 	if original, err := os.ReadFile(source); err != nil || string(original) != "portable" {
@@ -100,7 +99,7 @@ func TestCopyPortableExecutableUsesApplicationDirectoryAndSafeTarget(t *testing.
 	}
 }
 
-func TestCopyPortableExecutableRejectsSymlinkInSourceFolder(t *testing.T) {
+func TestCopyPortableExecutableRejectsSymlinkSelectedExecutable(t *testing.T) {
 	home := t.TempDir()
 	sourceDir := filepath.Join(home, "Downloads", "Portable App")
 	prefix := filepath.Join(home, "Programs Wine")
@@ -111,15 +110,18 @@ func TestCopyPortableExecutableRejectsSymlinkInSourceFolder(t *testing.T) {
 	if err := os.WriteFile(source, []byte("portable"), 0600); err != nil {
 		t.Fatal(err)
 	}
-	outside := filepath.Join(home, "outside.dat")
+	outside := filepath.Join(home, "outside.exe")
 	if err := os.WriteFile(outside, []byte("outside"), 0600); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.Symlink(outside, filepath.Join(sourceDir, "linked.dat")); err != nil {
+	if err := os.Remove(source); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(outside, source); err != nil {
 		t.Skipf("symlink creation unavailable: %v", err)
 	}
 	if _, err := copyPortableExecutable(source, prefix, "Portable App"); err == nil {
-		t.Fatal("expected symlinked companion file to be rejected")
+		t.Fatal("expected symlinked executable to be rejected")
 	}
 	if _, err := os.Stat(filepath.Join(prefix, "portable-app")); !os.IsNotExist(err) {
 		t.Fatalf("partial portable directory remains: %v", err)
@@ -237,6 +239,26 @@ type fakeProcess struct{}
 
 func (fakeProcess) Wait() error { return nil }
 
+type callbackProcess func() error
+
+func (process callbackProcess) Wait() error { return process() }
+
+func awaitInstallerStatus(t *testing.T, statuses <-chan InstallerStatus, want string) InstallerStatus {
+	t.Helper()
+	deadline := time.NewTimer(time.Second)
+	defer deadline.Stop()
+	for {
+		select {
+		case status := <-statuses:
+			if status.Status == want {
+				return status
+			}
+		case <-deadline.C:
+			t.Fatalf("timed out waiting for installer status %q", want)
+		}
+	}
+}
+
 func TestInstallUsesWinePrefixAndMSIArguments(t *testing.T) {
 	home := t.TempDir()
 	old := userHomeDir
@@ -248,10 +270,15 @@ func TestInstallUsesWinePrefixAndMSIArguments(t *testing.T) {
 	}
 	var gotName string
 	var gotArgs, gotEnv []string
+	statuses := make(chan InstallerStatus, 2)
 	app := &App{startEnv: func(_ context.Context, env []string, name string, args ...string) (CommandProcess, error) {
 		gotEnv, gotName, gotArgs = env, name, args
 		return fakeProcess{}, nil
-	}, emit: func(context.Context, string, ...interface{}) {}}
+	}, emit: func(_ context.Context, _ string, values ...interface{}) {
+		if len(values) == 1 {
+			statuses <- values[0].(InstallerStatus)
+		}
+	}}
 	result := app.Install(InstallRequest{InstallerPath: path})
 	if !result.Success {
 		t.Fatalf("result = %#v", result)
@@ -259,14 +286,65 @@ func TestInstallUsesWinePrefixAndMSIArguments(t *testing.T) {
 	if gotName != "wine" || strings.Join(gotArgs, "\x00") != strings.Join([]string{"msiexec", "/i", path}, "\x00") || gotEnv[0] != "WINEPREFIX="+filepath.Join(home, "Programs Wine") {
 		t.Fatalf("command=%s %#v env=%#v", gotName, gotArgs, gotEnv)
 	}
+	failed := awaitInstallerStatus(t, statuses, "failed")
 	configPath := filepath.Join(home, "Programs Wine", "setup", "config.json")
-	for range 100 {
-		if _, err := os.Stat(configPath); err == nil {
-			return
-		}
-		time.Sleep(time.Millisecond)
+	if _, err := os.Stat(configPath); !os.IsNotExist(err) {
+		t.Fatalf("invalid MSI metadata was written: %v", err)
 	}
-	t.Fatal("MSI metadata was not written")
+	if !strings.Contains(failed.Message, "ejecutable instalado válido") {
+		t.Fatalf("failed status = %#v", failed)
+	}
+}
+
+func TestInstallPersistsMSIMetadataWhenExecutableIsDiscovered(t *testing.T) {
+	home := t.TempDir()
+	old := userHomeDir
+	userHomeDir = func() (string, error) { return home, nil }
+	t.Cleanup(func() { userHomeDir = old })
+	path := filepath.Join(home, "setup.msi")
+	if err := os.WriteFile(path, nil, 0600); err != nil {
+		t.Fatal(err)
+	}
+	prefix := filepath.Join(home, "Programs Wine")
+	target := filepath.Join(prefix, "drive_c", "Program Files", "Acme", "Acme.exe")
+	statuses := make(chan InstallerStatus, 2)
+	app := &App{
+		startEnv: func(context.Context, []string, string, ...string) (CommandProcess, error) {
+			if err := os.MkdirAll(filepath.Dir(target), 0755); err != nil {
+				return nil, err
+			}
+			if err := os.WriteFile(target, nil, 0600); err != nil {
+				return nil, err
+			}
+			return callbackProcess(func() error { return nil }), nil
+		},
+		emit: func(_ context.Context, _ string, values ...interface{}) {
+			if len(values) == 1 {
+				statuses <- values[0].(InstallerStatus)
+			}
+		},
+	}
+	result := app.Install(InstallRequest{InstallerPath: path})
+	if !result.Success {
+		t.Fatalf("result = %#v", result)
+	}
+	completed := awaitInstallerStatus(t, statuses, "completed")
+	if !strings.Contains(completed.Message, "correctamente") {
+		t.Fatalf("completed status = %#v", completed)
+	}
+	configPath := filepath.Join(prefix, "setup", "config.json")
+	data, err := os.ReadFile(configPath)
+	if err != nil {
+		t.Fatalf("valid MSI metadata was not written: %v", err)
+	}
+	var config appConfig
+	if err := json.Unmarshal(data, &config); err != nil {
+		t.Fatalf("invalid MSI metadata: %v", err)
+	}
+	installDir := filepath.Dir(target)
+	if config.Type != "msi" || config.Target != target || config.InstallDir != installDir {
+		t.Fatalf("MSI metadata = %#v, want type %q, target %q, install directory %q", config, "msi", target, installDir)
+	}
 }
 
 func TestRunPortableUsesWinePrefixAndSelectedExecutable(t *testing.T) {

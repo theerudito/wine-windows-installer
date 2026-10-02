@@ -194,9 +194,18 @@ func copyPortableExecutable(source, prefix, name string) (string, error) {
 	if pathsOverlap(sourceDir, appDir) {
 		return "", errors.New("la carpeta de origen y destino del portable no pueden superponerse")
 	}
-	if err := copyPortableDirectory(sourceDir, appDir); err != nil {
+	if err := os.MkdirAll(appDir, 0755); err != nil {
+		return "", fmt.Errorf("no se pudo preparar la carpeta de la aplicación: %w", err)
+	}
+	data, err := os.ReadFile(source)
+	if err != nil {
 		_ = os.RemoveAll(appDir)
-		return "", err
+		return "", fmt.Errorf("no se pudo leer el ejecutable portable: %w", err)
+	}
+	mode := info.Mode().Perm() | 0111
+	if err := os.WriteFile(destination, data, mode); err != nil {
+		_ = os.RemoveAll(appDir)
+		return "", fmt.Errorf("no se pudo copiar el ejecutable portable: %w", err)
 	}
 	return destination, nil
 }
@@ -207,53 +216,6 @@ func pathsOverlap(first, second string) bool {
 	firstInSecond, _ := filepath.Rel(second, first)
 	secondInFirst, _ := filepath.Rel(first, second)
 	return firstInSecond == "." || (firstInSecond != ".." && !strings.HasPrefix(firstInSecond, ".."+string(filepath.Separator))) || secondInFirst == "." || (secondInFirst != ".." && !strings.HasPrefix(secondInFirst, ".."+string(filepath.Separator)))
-}
-
-func copyPortableDirectory(sourceDir, destinationDir string) error {
-	if err := os.MkdirAll(destinationDir, 0755); err != nil {
-		return fmt.Errorf("no se pudo preparar la carpeta de la aplicación: %w", err)
-	}
-	return filepath.WalkDir(sourceDir, func(path string, entry os.DirEntry, walkErr error) error {
-		if walkErr != nil {
-			return walkErr
-		}
-		info, err := entry.Info()
-		if err != nil {
-			return err
-		}
-		rel, err := filepath.Rel(sourceDir, path)
-		if err != nil {
-			return err
-		}
-		if rel == "." {
-			return nil
-		}
-		target := filepath.Join(destinationDir, rel)
-		if info.Mode()&os.ModeSymlink != 0 {
-			return fmt.Errorf("el portable contiene un enlace simbólico: %s", rel)
-		}
-		if err := validateNoSymlinkPath(destinationDir, target); err != nil {
-			return err
-		}
-		if info.IsDir() {
-			return os.MkdirAll(target, 0755)
-		}
-		if !info.Mode().IsRegular() {
-			return fmt.Errorf("el portable contiene un archivo no regular: %s", rel)
-		}
-		data, err := os.ReadFile(path)
-		if err != nil {
-			return fmt.Errorf("no se pudo leer el archivo portable %s: %w", rel, err)
-		}
-		mode := info.Mode().Perm()
-		if strings.EqualFold(filepath.Ext(path), ".exe") {
-			mode |= 0111
-		}
-		if err := os.WriteFile(target, data, mode); err != nil {
-			return fmt.Errorf("no se pudo copiar el archivo portable %s: %w", rel, err)
-		}
-		return nil
-	})
 }
 
 func safeDesktopFilename(name string) string {

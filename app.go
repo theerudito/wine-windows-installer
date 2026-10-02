@@ -203,7 +203,16 @@ func (a *App) finishInstall(process CommandProcess, req InstallRequest, target, 
 	message := "La aplicación finalizó correctamente."
 	installDir := ""
 	if strings.EqualFold(filepath.Ext(req.InstallerPath), ".msi") {
-		target, _, installDir = discoverInstalledLocation(prefix, before)
+		var count int
+		target, count, installDir = discoverInstalledLocation(prefix, before)
+		if count != 1 || target == "" || installDir == "" {
+			a.emit(a.commandContext(), "installer-status", InstallerStatus{Status: "failed", Message: "La instalación terminó, pero no se pudo encontrar un ejecutable instalado válido. No se guardó la configuración."})
+			return
+		}
+		if _, err := safeMSIInstallDirectory(prefix, target, installDir); err != nil {
+			a.emit(a.commandContext(), "installer-status", InstallerStatus{Status: "failed", Message: fmt.Sprintf("La instalación terminó, pero el ejecutable instalado no es válido: %v. No se guardó la configuración.", err)})
+			return
+		}
 		message = "La instalación terminó correctamente."
 	}
 	home, err := userHomeDir()
